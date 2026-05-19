@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "timetraveller"
+version = "0.1.0"
+description = "Local pax+rsync backup tool for Linux with PyQt GUI"
+requires-python = ">=3.11"
+dependencies = [
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+gui = ["PyQt6>=6.5"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+timetraveller-backup = "timetraveller.worker:main"
+
+[tool.setuptools.packages.find]
+include = ["timetraveller*"]

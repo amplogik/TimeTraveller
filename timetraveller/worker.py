@@ -1,0 +1,991 @@
+"""TimeTraveller backup worker CLI.
+
+This is what cron invokes for scheduled backups, and what the GUI invokes for
+manual runs and inspection commands. All actions on a plan go through here.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import socket
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from . import archive as archivelib
+from . import config as configlib
+from . import index as indexlib
+from . import manifest as manifestlib
+from . import mounts as mountslib
+from . import pax as paxlib
+from . import retention as retentionlib
+from . import schedule as schedulelib
+
+LIST_FILES_DEFAULT_CAP = 10000
+
+WEEKDAY_INDEX = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+
+
+# ---------- argument parsing ----------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="timetraveller-backup",
+        description="Run, inspect, and maintain TimeTraveller backups.",
+    )
+    p.add_argument("--plan", required=True,
+                   help="Plan name (e.g., home, system). Loads config from "
+                        "~/.config/timetraveller/<plan>.yaml or /etc/timetraveller/<plan>.yaml.")
+    p.add_argument("--config", type=Path, default=None,
+                   help="Use this config file instead of the default lookup.")
+
+    # --kind is a clarifier, not an action. It picks full vs incr for whatever
+    # operation runs (backup, dry-run, list-files). Actions below are mutually
+    # exclusive among themselves.
+    p.add_argument("--kind", choices=("full", "incr", "auto"), default=None,
+                   help="What kind of backup to take/simulate. 'auto' decides "
+                        "from today's date vs the schedule.")
+
+    actions = p.add_mutually_exclusive_group()
+    actions.add_argument("--dry-run", action="store_true",
+                         help="Resolve sources and excludes and print the pax command, but don't run.")
+    actions.add_argument("--show-mounts", action="store_true",
+                         help="Print every mount classified as local/nfs/cifs/removable/pseudo/destination.")
+    actions.add_argument("--list-files", action="store_true",
+                         help=f"Walk the source tree and print files that would be archived. "
+                              f"Caps at {LIST_FILES_DEFAULT_CAP} entries unless --list-files-all is given.")
+    actions.add_argument("--list-archives", action="store_true",
+                         help="Print archives recorded in the local manifest mirror for this plan. "
+                              "Does not touch the backup mount. Pair with --refresh-from-mount on "
+                              "first use, or any time the mirror may be stale.")
+    actions.add_argument("--reindex", nargs="?", const="*", default=None,
+                         help="Regenerate .idx.zst sidecar(s). With no arg, fixes missing sidecars. "
+                              "Pass an archive filename to force-regenerate one.")
+    actions.add_argument("--verify", type=str, default=None,
+                         help="Stream the named archive through pax -r to /dev/null to check integrity.")
+    actions.add_argument("--prune", action="store_true",
+                         help="Apply retention without taking a new backup.")
+    actions.add_argument("--show-schedule", action="store_true",
+                         help="Render the cron block for this plan to stdout (no install).")
+    actions.add_argument("--install-schedule", action="store_true",
+                         help="Install the cron block. For plan=home: user crontab. "
+                              "For plan=system: invokes pkexec to update root's crontab.")
+    actions.add_argument("--uninstall-schedule", action="store_true",
+                         help="Remove the managed cron block for this plan.")
+    actions.add_argument("--suspend-schedule", action="store_true",
+                         help="Comment out the cron entries for this plan (block stays installed).")
+    actions.add_argument("--resume-schedule", action="store_true",
+                         help="Uncomment previously-suspended cron entries for this plan.")
+
+    p.add_argument("--list-files-all", action="store_true",
+                   help="With --list-files, remove the cap.")
+    p.add_argument("--refresh-from-mount", action="store_true",
+                   help="With --list-archives: re-read the on-mount manifest "
+                        "and overwrite the local mirror before printing. "
+                        "Touches the backup mount.")
+    p.add_argument("--check-orphans", action="store_true",
+                   help="With --list-archives: also enumerate archive files "
+                        "on the mount that are absent from the manifest. "
+                        "Touches the backup mount.")
+    p.add_argument("--binary-path", type=str, default=None,
+                   help="Path to timetraveller-backup to use in cron entries. "
+                        "Defaults to /usr/local/bin/timetraveller-backup, or the "
+                        "currently-running script if --dev-binary-path is set.")
+    p.add_argument("--dev-binary-path", action="store_true",
+                   help="Use the running script's resolved path in cron entries "
+                        "(home plan only; the pkexec helper rejects non-/usr/local paths).")
+
+    # Per-run overrides.
+    p.add_argument("--source", action="append", default=[],
+                   help="Add a source path for this run (repeatable).")
+    p.add_argument("--exclude", action="append", default=[],
+                   help="Add an exclude pattern for this run (repeatable).")
+    p.add_argument("--include-mount", action="append", default=[],
+                   help="Force-include this mountpoint for this run (repeatable).")
+    p.add_argument("--exclude-mount", action="append", default=[],
+                   help="Force-exclude this mountpoint for this run (repeatable).")
+    p.add_argument("--include-removable", action="store_true",
+                   help="Include all removable mounts under sources for this run.")
+    p.add_argument("--include-nfs", action="store_true",
+                   help="Include NFS mounts under sources for this run.")
+    p.add_argument("--include-cifs", action="store_true",
+                   help="Include CIFS mounts (other than the destination) for this run.")
+    p.add_argument("--destination", type=str, default=None,
+                   help="Override the config destination for this run.")
+    p.add_argument("--no-retention", action="store_true",
+                   help="Skip the retention pass after this run.")
+    p.add_argument("--manual", action="store_true",
+                   help="Mark this as a manual (not scheduled) run; uses HHMMSS in the filename "
+                        "to avoid colliding with same-day scheduled runs.")
+    p.add_argument("--log-file", type=Path, default=None,
+                   help="Append pax/zstd stderr to this file.")
+    p.add_argument("--quiet", action="store_true")
+    p.add_argument("--verbose", "-v", action="store_true")
+    return p
+
+
+# ---------- helpers ----------
+
+def _load_plan(args: argparse.Namespace) -> configlib.PlanConfig:
+    if args.config:
+        return configlib.load(args.config)
+    path = configlib.resolve_config_path(args.plan)
+    return configlib.load(path)
+
+
+def _effective_plan(args: argparse.Namespace, plan: configlib.PlanConfig) -> configlib.PlanConfig:
+    """Apply per-run overrides to a copy of the plan config (additive)."""
+    if args.source:
+        plan.sources = list(plan.sources) + list(args.source)
+    if args.exclude:
+        plan.excludes = list(plan.excludes) + list(args.exclude)
+    if args.include_mount:
+        plan.include_mounts = list(plan.include_mounts) + list(args.include_mount)
+    if args.exclude_mount:
+        plan.exclude_mounts = list(plan.exclude_mounts) + list(args.exclude_mount)
+    if args.include_removable:
+        plan.include_removable = True
+    if args.include_nfs:
+        plan.include_nfs = True
+    if args.include_cifs:
+        plan.include_cifs = True
+    if args.destination:
+        plan.destination = args.destination
+    return plan
+
+
+def _is_full_day(plan: configlib.PlanConfig, now: datetime) -> bool:
+    """Would today fire a scheduled full backup for this plan?"""
+    sch = plan.schedule
+    if sch.mode == "weekly":
+        return now.strftime("%a").lower()[:3] in sch.full.days
+    if sch.mode == "monthly":
+        return now.day == sch.full.day_of_month
+    return False
+
+
+def _is_incr_day(plan: configlib.PlanConfig, now: datetime) -> bool:
+    """Would today fire a scheduled incremental backup for this plan?"""
+    sch = plan.schedule
+    weekday = now.strftime("%a").lower()[:3]
+    if sch.incr.mode == "disabled":
+        return False
+    if sch.mode == "weekly":
+        if sch.incr.mode == "except_full":
+            return weekday not in set(sch.full.days)
+        if sch.incr.mode == "weekdays":
+            return weekday in sch.incr.days
+        return False
+    if sch.mode == "monthly":
+        if sch.incr.mode == "weekdays":
+            return weekday in sch.incr.days
+        if sch.incr.mode == "every_n_days":
+            n = max(2, int(sch.incr.every_n_days))
+            return ((now.day - 1) % n) == 0
+        return False
+    return False
+
+
+def _resolve_kind(kind: str | None, plan: configlib.PlanConfig, now: datetime) -> str:
+    """Decide full vs incr when --kind=auto (or no kind given). Full wins on
+    a day where both schedules would fire."""
+    if kind in ("full", "incr"):
+        return kind
+    if _is_full_day(plan, now):
+        return "full"
+    if _is_incr_day(plan, now):
+        return "incr"
+    raise SystemExit(
+        f"--kind=auto but today ({now.strftime('%a').lower()}, "
+        f"day {now.day}) is not scheduled. Pass --kind full or --kind incr to force."
+    )
+
+
+def _incremental_window(manifest: manifestlib.Manifest,
+                        now: datetime) -> tuple[datetime, datetime]:
+    """Find the time window for an incremental: last successful backup → now.
+
+    Falls back to yesterday-00:00 → now if no prior successful backup exists.
+    """
+    # "empty" counts as a successful run for the purposes of windowing: there
+    # was simply nothing to archive, but we did check.
+    successes = [a for a in manifest.archives
+                 if a.status in ("ok", "ok-with-warnings", "empty") and a.date_finished]
+    if successes:
+        last = max(successes, key=lambda a: a.date_finished)
+        frm = datetime.fromisoformat(last.date_finished)
+        if frm.tzinfo is None:
+            frm = frm.replace(tzinfo=timezone.utc)
+        return frm, now
+    yesterday = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return yesterday, now
+
+
+def _log(args: argparse.Namespace, msg: str) -> None:
+    if not args.quiet:
+        print(msg, flush=True)
+
+
+def _save_manifest(m: manifestlib.Manifest, archive_dir: Path, plan_name: str) -> None:
+    """Persist the manifest to the on-mount location and the local mirror.
+
+    The on-mount write is authoritative — any failure there propagates. The
+    mirror write is best-effort: a failure (e.g. XDG_STATE_HOME unwritable)
+    is logged but never fails the backup, since the mirror is purely a
+    browse-path optimization.
+    """
+    manifestlib.save(m, manifestlib.manifest_path(archive_dir))
+    try:
+        manifestlib.save(m, manifestlib.mirror_manifest_path(plan_name))
+    except OSError as e:
+        print(f"WARNING: manifest mirror write failed: {e}", file=sys.stderr)
+
+
+def _mirror_sidecar(plan_name: str, source_sidecar: Path,
+                    archive_filename: str) -> None:
+    """Best-effort copy of an on-mount sidecar into the local mirror.
+
+    Mirror failure is logged but never propagated — the on-mount sidecar
+    remains authoritative for restore; the mirror is only for offline browse.
+    """
+    try:
+        indexlib.copy_sidecar_to_mirror(plan_name, source_sidecar, archive_filename)
+    except OSError as e:
+        print(f"WARNING: sidecar mirror copy failed: {e}", file=sys.stderr)
+
+
+# ---------- action handlers ----------
+
+def action_show_mounts(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
+    report = mountslib.filter_sources(
+        plan.sources, plan.destination,
+        include_removable=plan.include_removable,
+        include_nfs=plan.include_nfs,
+        include_cifs=plan.include_cifs,
+        include_mounts=plan.include_mounts,
+        exclude_mounts=plan.exclude_mounts,
+    )
+    print(mountslib.format_report(report))
+    return 0
+
+
+def action_list_archives(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
+    archive_dir = plan.archive_dir()
+
+    if args.refresh_from_mount:
+        on_mount = manifestlib.load(manifestlib.manifest_path(archive_dir))
+        # Backfill has_sidecar from disk and seed the local sidecar mirror
+        # while we're already touching the mount.
+        for entry in on_mount.archives:
+            sc = indexlib.sidecar_path(archive_dir / entry.filename)
+            entry.has_sidecar = sc.exists()
+            if entry.has_sidecar:
+                _mirror_sidecar(plan.plan_name, sc, entry.filename)
+        _save_manifest(on_mount, archive_dir, plan.plan_name)
+
+    mirror = manifestlib.mirror_manifest_path(plan.plan_name)
+    if not mirror.exists():
+        print(
+            f"No local manifest mirror for plan {plan.plan_name!r} at {mirror}.\n"
+            f"Run with --refresh-from-mount once to populate it from the on-mount manifest.",
+            file=sys.stderr,
+        )
+        return 1
+
+    listing = archivelib.list_from_manifest(plan.plan_name, archive_dir)
+
+    if not listing.cycles:
+        print(f"No archives recorded for plan {plan.plan_name!r} at {archive_dir}.")
+    else:
+        total_archives = sum(len(c.archives) for c in listing.cycles)
+        print(f"Plan: {plan.plan_name}   Destination: {archive_dir}")
+        print(f"Cycles: {len(listing.cycles)}   Archives: {total_archives}")
+        for c in listing.cycles:
+            status = "complete" if c.is_complete else "INCOMPLETE"
+            print(f"\n  Cycle {c.cycle_id} [{status}]  total {c.total_size/1024**2:.1f} MiB")
+            for a in c.archives:
+                tag = a.status if a.status != "ok" else ""
+                tag = f"  [{tag}]" if tag else ""
+                print(f"    {a.kind:5s}  {a.filename:50s}  {a.size_bytes/1024**2:9.1f} MiB{tag}")
+
+    if args.check_orphans:
+        orphans = archivelib.discover_orphans(archive_dir)
+        if orphans:
+            print(f"\nOrphans on mount ({len(orphans)} archive(s) not in manifest):")
+            for o in orphans:
+                print(f"    {o.kind:5s}  {o.filename:50s}  {o.size_bytes/1024**2:9.1f} MiB")
+        else:
+            print("\nNo orphans on mount.")
+
+    return 0
+
+
+def action_dry_run(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
+    now = datetime.now(timezone.utc)
+    kind = _resolve_kind(args.kind, plan, now)
+
+    archive_dir = plan.archive_dir()
+    fname = paxlib.archive_filename(dt=now, kind=kind, manual=args.manual)
+    archive_path = archive_dir / fname
+
+    report = mountslib.filter_sources(
+        plan.sources, plan.destination,
+        include_removable=plan.include_removable,
+        include_nfs=plan.include_nfs,
+        include_cifs=plan.include_cifs,
+        include_mounts=plan.include_mounts,
+        exclude_mounts=plan.exclude_mounts,
+    )
+
+    incr_window = None
+    if kind == "incr":
+        mirror = manifestlib.mirror_manifest_path(plan.plan_name)
+        if not mirror.exists():
+            print(
+                f"No local manifest mirror for plan {plan.plan_name!r} at {mirror}.\n"
+                f"Run `--list-archives --refresh-from-mount` once to populate it "
+                f"before dry-running an incremental.",
+                file=sys.stderr,
+            )
+            return 1
+        m = manifestlib.load(mirror)
+        incr_window = _incremental_window(m, now)
+
+    sources_rel, chdir = _relative_sources(plan.sources)
+
+    inv = paxlib.PaxInvocation(
+        sources=sources_rel,
+        chdir=chdir,
+        archive_path=archive_path,
+        excludes=plan.excludes,
+        extra_mount_excludes=report.additional_excludes,
+        incr_window=incr_window,
+        compression=plan.compression,
+        one_filesystem=True,
+        extra_pax_flags=plan.extra_pax_flags,
+    )
+
+    print(f"Plan:        {plan.plan_name}")
+    print(f"Kind:        {kind}")
+    print(f"Archive:     {archive_path}")
+    if incr_window:
+        print(f"Incr window: {incr_window[0].isoformat()} .. {incr_window[1].isoformat()}")
+    print(f"chdir:       {chdir}")
+    print(f"Sources:     {sources_rel}")
+    print(f"\nMount filter:")
+    print(mountslib.format_report(report))
+    print(f"\npax command (would run from cwd={chdir}):")
+    print("  " + " ".join(_shell_quote(x) for x in inv.pax_argv()))
+    print(f"\nzstd command:")
+    print("  " + " ".join(_shell_quote(x) for x in inv.zstd_argv()))
+    return 0
+
+
+def action_list_files(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
+    # Walk the effective source tree honoring -X (no crossing mount boundaries)
+    # and excludes, printing files we'd archive.
+    cap = None if args.list_files_all else LIST_FILES_DEFAULT_CAP
+
+    report = mountslib.filter_sources(
+        plan.sources, plan.destination,
+        include_removable=plan.include_removable,
+        include_nfs=plan.include_nfs,
+        include_cifs=plan.include_cifs,
+        include_mounts=plan.include_mounts,
+        exclude_mounts=plan.exclude_mounts,
+    )
+    skip_targets = set(report.additional_excludes)
+
+    # Compile excludes once. glob_to_regexes returns 1-2 patterns per glob.
+    import re as _re
+    patterns: list = []
+    for g in plan.excludes:
+        for rx in paxlib.glob_to_regexes(g):
+            patterns.append(_re.compile(rx))
+
+    def excluded(path: str) -> bool:
+        for pat in patterns:
+            if pat.match(path):
+                return True
+        return False
+
+    count = 0
+    for source in plan.sources:
+        src = Path(source).resolve()
+        try:
+            src_dev = src.stat().st_dev
+        except OSError:
+            continue
+        for root, dirs, files in os.walk(src, followlinks=False):
+            # Prune mount-boundary crossings and explicit excludes.
+            dirs[:] = sorted(d for d in dirs if not _should_prune(
+                root, d, src_dev, skip_targets, excluded))
+            for fname in sorted(files):
+                full = os.path.join(root, fname)
+                rel = "./" + os.path.relpath(full, "/")
+                if excluded(rel) or excluded(full):
+                    continue
+                print(full)
+                count += 1
+                if cap is not None and count >= cap:
+                    print(f"[capped at {cap}; pass --list-files-all to see everything]",
+                          file=sys.stderr)
+                    return 0
+    return 0
+
+
+def _should_prune(root: str, d: str, src_dev: int, skip_targets: set[str],
+                  excluded_fn) -> bool:
+    full = os.path.join(root, d)
+    if full in skip_targets:
+        return True
+    try:
+        st = os.lstat(full)
+    except OSError:
+        return True
+    if st.st_dev != src_dev:
+        return True
+    rel = "./" + os.path.relpath(full, "/")
+    if excluded_fn(rel) or excluded_fn(full):
+        return True
+    return False
+
+
+def action_reindex(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
+    archive_dir = plan.archive_dir()
+    target = args.reindex
+    if target == "*":
+        archives = sorted(p for p in archive_dir.glob("*.pax.zst"))
+        archives = [a for a in archives if not indexlib.sidecar_path(a).exists()]
+    else:
+        archives = [archive_dir / target]
+    if not archives:
+        _log(args, "reindex: nothing to do")
+        return 0
+
+    m = manifestlib.load(manifestlib.manifest_path(archive_dir))
+    by_filename = {a.filename: a for a in m.archives}
+    for a in archives:
+        _log(args, f"reindex: {a.name}")
+        indexlib.write_sidecar(a)
+        entry = by_filename.get(a.name)
+        if entry is not None:
+            entry.has_sidecar = True
+        _mirror_sidecar(plan.plan_name, indexlib.sidecar_path(a), a.name)
+    _save_manifest(m, archive_dir, plan.plan_name)
+    return 0
+
+
+def action_verify(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
+    import subprocess
+    archive = plan.archive_dir() / args.verify
+    if not archive.exists():
+        print(f"archive not found: {archive}", file=sys.stderr)
+        return 1
+    # Stream the archive through `tar -tf` (list mode) so tar reads every
+    # entry header end-to-end without extracting. Any corruption shows up
+    # as a non-zero exit code.
+    zstdcat = subprocess.Popen(["zstdcat", str(archive)], stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL)
+    tar = subprocess.Popen(["tar", "-tf", "-"], stdin=zstdcat.stdout,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    zstdcat.stdout.close()  # type: ignore[union-attr]
+    _, err = tar.communicate()
+    zstdcat.wait()
+    if tar.returncode != 0:
+        print(f"verify: archive {archive.name} FAILED", file=sys.stderr)
+        if err:
+            print(err.decode(errors="replace"), file=sys.stderr)
+        return 1
+    print(f"verify: archive {archive.name} OK")
+    return 0
+
+
+def action_prune(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
+    archive_dir = plan.archive_dir()
+    mpath = manifestlib.manifest_path(archive_dir)
+    m = manifestlib.load(mpath)
+    if not m.plan_name:
+        m.plan_name = plan.plan_name
+    plan_obj = retentionlib.apply(
+        m,
+        policy=plan.retention.policy,
+        max_cycles=plan.retention.max_cycles,
+        max_age_days=plan.retention.max_age_days,
+        max_size_gb=plan.retention.max_size_gb,
+    )
+    print(retentionlib.format_plan(plan_obj))
+    if not plan_obj.delete:
+        return 0
+    for cycle in plan_obj.delete:
+        for a in cycle.archives:
+            apath = archive_dir / a.filename
+            spath = indexlib.sidecar_path(apath)
+            for p in (apath, spath):
+                if p.exists():
+                    _log(args, f"prune: rm {p}")
+                    p.unlink()
+            indexlib.delete_sidecar_mirror(plan.plan_name, a.filename)
+            m.remove(a.filename)
+    _save_manifest(m, archive_dir, plan.plan_name)
+    return 0
+
+
+DEFAULT_INSTALLED_BINARY = "/usr/local/bin/timetraveller-backup"
+PKEXEC_HELPER_PATH = "/usr/libexec/timetraveller-install-system-cron"
+
+
+def _binary_path_for_cron(args: argparse.Namespace, plan: configlib.PlanConfig) -> str:
+    """Pick which timetraveller-backup path to embed in cron entries."""
+    if args.binary_path:
+        return args.binary_path
+    if args.dev_binary_path:
+        if plan.plan_name == "system":
+            raise SystemExit(
+                "ERROR: --dev-binary-path is only allowed for the home plan. "
+                "The pkexec helper rejects non-/usr/local paths for security. "
+                "Install via install.sh for system schedules."
+            )
+        return os.path.realpath(sys.argv[0])
+    return DEFAULT_INSTALLED_BINARY
+
+
+def _read_user_crontab() -> str:
+    """Return the current user's crontab text, or '' if none."""
+    import subprocess
+    r = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    # crontab exits 1 with "no crontab for X" when empty; treat as empty.
+    if r.returncode != 0 and "no crontab" not in (r.stderr or ""):
+        # Unexpected error — propagate.
+        sys.stderr.write(r.stderr)
+        raise SystemExit(2)
+    return r.stdout or ""
+
+
+def _write_user_crontab(text: str) -> None:
+    import subprocess
+    r = subprocess.run(["crontab", "-"], input=text, text=True, capture_output=True)
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr)
+        raise SystemExit(2)
+
+
+def action_show_schedule(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
+    bin_path = _binary_path_for_cron(args, plan)
+    block = schedulelib.render_block(plan, bin_path)
+    errors = schedulelib.validate_block(block, plan.plan_name)
+    if errors:
+        # This would be a bug in our renderer — emit to stderr but still print.
+        for e in errors:
+            print(f"validation: {e}", file=sys.stderr)
+    print(block, end="")
+    return 0 if not errors else 1
+
+
+def action_install_schedule(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
+    bin_path = _binary_path_for_cron(args, plan)
+    block = schedulelib.render_block(plan, bin_path)
+
+    if plan.plan_name == "system":
+        # Delegate to pkexec helper. The helper reads root's crontab, swaps
+        # the plan's managed block, validates, and writes back.
+        import subprocess
+        _log(args, f"Installing system schedule via pkexec {PKEXEC_HELPER_PATH}")
+        r = subprocess.run(
+            ["pkexec", PKEXEC_HELPER_PATH, "install", plan.plan_name],
+            input=block, text=True, capture_output=True,
+        )
+        if r.stdout:
+            sys.stdout.write(r.stdout)
+        if r.returncode != 0:
+            sys.stderr.write(r.stderr or "")
+            print(f"\nERROR: helper exited {r.returncode}", file=sys.stderr)
+            return r.returncode
+        return 0
+
+    # User crontab path: do it directly, no pkexec.
+    current = _read_user_crontab()
+    new = schedulelib.replace_block(current, plan.plan_name, block)
+    # Validate the resulting managed block (defense in depth).
+    extracted = schedulelib.find_block(new, plan.plan_name) or ""
+    errors = schedulelib.validate_block(extracted, plan.plan_name)
+    if errors:
+        for e in errors:
+            print(f"validation: {e}", file=sys.stderr)
+        return 1
+    _write_user_crontab(new)
+    _log(args, f"Schedule installed in user crontab for plan {plan.plan_name!r}.")
+    _log(args, "Inspect with: crontab -l")
+    return 0
+
+
+def _toggle_schedule(args: argparse.Namespace, plan: configlib.PlanConfig,
+                     mode: str) -> int:
+    """Shared implementation for suspend and resume."""
+    assert mode in ("suspend", "resume")
+    if plan.plan_name == "system":
+        import subprocess
+        _log(args, f"{mode} system schedule via pkexec {PKEXEC_HELPER_PATH}")
+        r = subprocess.run(
+            ["pkexec", PKEXEC_HELPER_PATH, mode, plan.plan_name],
+            text=True, capture_output=True,
+        )
+        if r.stdout:
+            sys.stdout.write(r.stdout)
+        if r.returncode != 0:
+            sys.stderr.write(r.stderr or "")
+            return r.returncode
+        return 0
+
+    # Home plan: edit user crontab directly.
+    current = _read_user_crontab()
+    if schedulelib.find_block(current, plan.plan_name) is None:
+        print(f"No managed block for plan {plan.plan_name!r}; nothing to {mode}.",
+              file=sys.stderr)
+        return 1
+    state = schedulelib.is_block_suspended(current, plan.plan_name)
+    if mode == "suspend" and state is True:
+        _log(args, "Already suspended; nothing to do.")
+        return 0
+    if mode == "resume" and state is False:
+        _log(args, "Already active; nothing to do.")
+        return 0
+    if mode == "suspend":
+        new = schedulelib.suspend_block(current, plan.plan_name)
+    else:
+        new = schedulelib.resume_block(current, plan.plan_name)
+    _write_user_crontab(new)
+    past = "suspended" if mode == "suspend" else "resumed"
+    _log(args, f"Schedule {past} for plan {plan.plan_name!r}.")
+    return 0
+
+
+def action_suspend_schedule(args, plan):
+    return _toggle_schedule(args, plan, "suspend")
+
+
+def action_resume_schedule(args, plan):
+    return _toggle_schedule(args, plan, "resume")
+
+
+def action_uninstall_schedule(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
+    if plan.plan_name == "system":
+        import subprocess
+        _log(args, f"Removing system schedule via pkexec {PKEXEC_HELPER_PATH}")
+        r = subprocess.run(
+            ["pkexec", PKEXEC_HELPER_PATH, "uninstall", plan.plan_name],
+            text=True, capture_output=True,
+        )
+        if r.stdout:
+            sys.stdout.write(r.stdout)
+        if r.returncode != 0:
+            sys.stderr.write(r.stderr or "")
+            return r.returncode
+        return 0
+
+    current = _read_user_crontab()
+    if schedulelib.find_block(current, plan.plan_name) is None:
+        _log(args, f"No managed block for plan {plan.plan_name!r}; nothing to do.")
+        return 0
+    new = schedulelib.remove_block(current, plan.plan_name)
+    _write_user_crontab(new)
+    _log(args, f"Schedule removed from user crontab for plan {plan.plan_name!r}.")
+    return 0
+
+
+def _lock_path(plan_name: str) -> Path:
+    """Per-plan lock file path."""
+    if os.geteuid() == 0:
+        base = Path("/var/lock/timetraveller")
+    else:
+        base = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "timetraveller" / "locks"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / f"{plan_name}.lock"
+
+
+def _acquire_plan_lock(plan_name: str):
+    """Try to take a non-blocking exclusive lock on the plan. Returns the
+    open file (caller keeps it alive); raises SystemExit on contention.
+    """
+    import fcntl
+    path = _lock_path(plan_name)
+    fp = open(path, "w")
+    try:
+        fcntl.flock(fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fp.close()
+        print(f"Another timetraveller-backup is already running for plan "
+              f"{plan_name!r} (lock held at {path}). Exiting.", file=sys.stderr)
+        raise SystemExit(0)
+    return fp
+
+
+def action_backup(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
+    now = datetime.now(timezone.utc)
+    kind = _resolve_kind(args.kind, plan, now)
+
+    # If a SCHEDULED incremental coincides with a scheduled full day, defer:
+    # cron will run --kind full separately. Manual invocations are not
+    # deferred — the user asked for it explicitly.
+    if kind == "incr" and not args.manual and _is_full_day(plan, now):
+        _log(args, f"Deferring incremental: today is a scheduled full-backup day for plan "
+                   f"{plan.plan_name!r}; the full run will cover it.")
+        return 0
+
+    lock_fp = _acquire_plan_lock(plan.plan_name)  # noqa: F841 (held for the duration)
+
+    archive_dir = plan.archive_dir()
+    fname = paxlib.archive_filename(dt=now, kind=kind, manual=args.manual)
+    archive_path = archive_dir / fname
+    mpath = manifestlib.manifest_path(archive_dir)
+    m = manifestlib.load(mpath)
+    if not m.plan_name:
+        m.plan_name = plan.plan_name
+
+    report = mountslib.filter_sources(
+        plan.sources, plan.destination,
+        include_removable=plan.include_removable,
+        include_nfs=plan.include_nfs,
+        include_cifs=plan.include_cifs,
+        include_mounts=plan.include_mounts,
+        exclude_mounts=plan.exclude_mounts,
+    )
+
+    incr_window = None
+    incr_file_list: list[str] = []
+    cycle_id: str
+    if kind == "incr":
+        # Attach to current (most recent successful full).
+        cs = manifestlib.cycles(m)
+        complete = [c for c in cs if c.is_complete]
+        if not complete:
+            print("ERROR: incremental requested but no successful full exists in this plan. "
+                  "Run --kind full first.", file=sys.stderr)
+            return 2
+        cycle_id = complete[-1].cycle_id
+        incr_window = _incremental_window(m, now)
+
+        # Compute the file list in Python. We can't use pax -T because it
+        # exits 1 when the source operand's own mtime is outside the window,
+        # even when files under it qualify. Build the list ourselves and feed
+        # it to pax via stdin.
+        sources_abs = [str(Path(s).resolve()) for s in plan.sources]
+        excludes_re: list[str] = []
+        for g in plan.excludes:
+            excludes_re.extend(paxlib.glob_to_regexes(g))
+        incr_file_list = paxlib.list_changes_in_window(
+            sources_abs, excludes_re, report.additional_excludes,
+            incr_window[0], incr_window[1],
+        )
+        if not incr_file_list:
+            _log(args, f"No files changed in window "
+                       f"{incr_window[0].isoformat()} .. {incr_window[1].isoformat()}. "
+                       f"Recording empty incremental.")
+            entry = manifestlib.ArchiveEntry(
+                filename=fname,
+                kind=kind,
+                cycle_id=cycle_id,
+                date_started=now.isoformat(),
+                date_finished=datetime.now(timezone.utc).isoformat(),
+                size_bytes=0,
+                status="empty",
+                hostname=socket.gethostname(),
+                plan_name=plan.plan_name,
+                incr_window_from=incr_window[0].isoformat(),
+                incr_window_to=incr_window[1].isoformat(),
+                notes="No files changed in window; no archive written.",
+            )
+            m.append(entry)
+            _save_manifest(m, archive_dir, plan.plan_name)
+            if not args.no_retention:
+                action_prune(args, plan)
+            return 0
+    else:
+        # Use the archive filename's date component as the cycle_id. For
+        # scheduled runs that's just YYYY-MM-DD; for manual runs it includes
+        # the time, so multiple same-day fulls get distinct cycle ids.
+        parsed = paxlib.parse_filename(fname)
+        cycle_id = parsed[0] if parsed else now.strftime("%Y-%m-%d")
+
+    sources_rel, chdir = _relative_sources(plan.sources)
+
+    inv = paxlib.PaxInvocation(
+        sources=sources_rel,
+        chdir=chdir,
+        archive_path=archive_path,
+        excludes=plan.excludes,
+        extra_mount_excludes=report.additional_excludes,
+        incr_window=incr_window,
+        compression=plan.compression,
+        one_filesystem=True,
+        extra_pax_flags=plan.extra_pax_flags,
+    )
+
+    hostname = socket.gethostname()
+    entry = manifestlib.ArchiveEntry(
+        filename=fname,
+        kind=kind,
+        cycle_id=cycle_id,
+        date_started=now.isoformat(),
+        date_finished="",
+        size_bytes=0,
+        status="in-progress",
+        hostname=hostname,
+        plan_name=plan.plan_name,
+        incr_window_from=incr_window[0].isoformat() if incr_window else "",
+        incr_window_to=incr_window[1].isoformat() if incr_window else "",
+    )
+    m.append(entry)
+    _save_manifest(m, archive_dir, plan.plan_name)
+
+    log_path = args.log_file or _default_log_path(plan.plan_name)
+    _log(args, f"Running {kind} backup → {archive_path}")
+
+    sources_abs = [str(Path(s).resolve()) for s in plan.sources]
+    excludes_re: list[str] = []
+    for g in plan.excludes:
+        excludes_re.extend(paxlib.glob_to_regexes(g))
+
+    if kind == "incr":
+        _log(args, f"  ({len(incr_file_list)} changed files)")
+        result = paxlib.run_with_file_list(inv, incr_file_list, log_file=log_path)
+    else:
+        # Stream the source trees through pax. We use the same file-list
+        # pipeline as incrementals so we can pre-filter sockets/FIFOs/device
+        # nodes (pax can't archive them and would otherwise exit 1).
+        file_iter = paxlib.iter_archivable_files(
+            sources_abs, excludes_re, report.additional_excludes,
+            mtime_window=None,         # no time filter for fulls
+            include_dirs=True,         # preserve directory metadata on restore
+            one_filesystem=True,       # mirror pax -X behaviour
+            skip_special=True,         # drop sockets/FIFOs/devices
+        )
+        result = paxlib.run_with_file_list(inv, file_iter, log_file=log_path)
+    finished = datetime.now(timezone.utc)
+
+    status = result.status
+    m.update_status(
+        fname,
+        status=status,
+        date_finished=finished.isoformat(),
+        size_bytes=result.archive_size,
+    )
+    _save_manifest(m, archive_dir, plan.plan_name)
+
+    if status == "failed":
+        print(f"ERROR: pax={result.pax_returncode} zstd={result.zstd_returncode}; "
+              f"see {log_path}", file=sys.stderr)
+        # Leave a marker file so the GUI surfaces it.
+        try:
+            archive_path.rename(archive_path.with_suffix(archive_path.suffix + ".failed"))
+        except OSError:
+            pass
+        return 1
+
+    if status == "ok-with-warnings":
+        print(f"WARNING: pax={result.pax_returncode} (non-fatal — archive is trustworthy); "
+              f"see {log_path}", file=sys.stderr)
+
+    _log(args, f"Archive: {result.archive_size/1024**2:.1f} MiB in {result.duration_seconds:.1f}s")
+
+    try:
+        indexlib.write_sidecar(archive_path)
+        _log(args, "Sidecar index written.")
+        for entry in m.archives:
+            if entry.filename == fname:
+                entry.has_sidecar = True
+                break
+        _save_manifest(m, archive_dir, plan.plan_name)
+        _mirror_sidecar(plan.plan_name, indexlib.sidecar_path(archive_path), fname)
+    except Exception as e:  # noqa: BLE001 - sidecar failure shouldn't fail the backup
+        print(f"WARNING: sidecar generation failed: {e}", file=sys.stderr)
+
+    if not args.no_retention:
+        prune_args = argparse.Namespace(**vars(args))
+        action_prune(prune_args, plan)
+
+    return 0
+
+
+def _relative_sources(sources: list[str]) -> tuple[list[str], str]:
+    """Translate absolute sources into relative paths under a common chdir.
+
+    We cd to / and emit paths like './home' or '.' — the leading `./` makes
+    pax emit archive members with the `./` prefix that our exclude regexes
+    target. (Compare: passing 'home' gets members 'home/...' without prefix.)
+    """
+    rel = []
+    for s in sources:
+        rs = Path(s).resolve()
+        if str(rs) == "/":
+            rel.append(".")
+        else:
+            rel.append("./" + str(rs.relative_to("/")))
+    return rel, "/"
+
+
+def _shell_quote(s: str) -> str:
+    if not s or any(c in s for c in ' \t\n"\'\\$`'):
+        return "'" + s.replace("'", "'\\''") + "'"
+    return s
+
+
+def _default_log_path(plan_name: str) -> Path:
+    if os.geteuid() == 0:
+        base = Path("/var/log/timetraveller")
+    else:
+        base = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "timetraveller"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / f"{plan_name}.log"
+
+
+# ---------- entry point ----------
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    try:
+        plan = _load_plan(args)
+    except FileNotFoundError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    except (ValueError, KeyError) as e:
+        print(f"ERROR: invalid config: {e}", file=sys.stderr)
+        return 2
+
+    plan = _effective_plan(args, plan)
+
+    if args.show_mounts:
+        return action_show_mounts(args, plan)
+    if args.list_archives:
+        return action_list_archives(args, plan)
+    if args.dry_run:
+        return action_dry_run(args, plan)
+    if args.list_files:
+        return action_list_files(args, plan)
+    if args.reindex is not None:
+        return action_reindex(args, plan)
+    if args.verify:
+        return action_verify(args, plan)
+    if args.prune:
+        return action_prune(args, plan)
+    if args.show_schedule:
+        return action_show_schedule(args, plan)
+    if args.install_schedule:
+        return action_install_schedule(args, plan)
+    if args.uninstall_schedule:
+        return action_uninstall_schedule(args, plan)
+    if args.suspend_schedule:
+        return action_suspend_schedule(args, plan)
+    if args.resume_schedule:
+        return action_resume_schedule(args, plan)
+
+    # Default action: take a backup.
+    if args.kind is None:
+        args.kind = "auto"
+    return action_backup(args, plan)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

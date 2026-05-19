@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""Privileged helper to install TimeTraveller's managed block in root's crontab.
+
+Invoked via pkexec by the unprivileged CLI/GUI. We run as root here, so this
+script is security-critical:
+
+ - The block to install is read from stdin and validated line-by-line against
+   a strict allowlist. No shell metacharacters, no commands other than the
+   trusted binary path, no plan names other than the requested one.
+ - The managed block is the ONLY thing this helper changes — everything else
+   in root's crontab is preserved verbatim.
+ - On any validation failure the helper exits non-zero before touching the
+   crontab.
+
+Usage (called by pkexec):
+    timetraveller-install-system-cron install <plan>      # block via stdin
+    timetraveller-install-system-cron uninstall <plan>
+    timetraveller-install-system-cron suspend <plan>      # comment block entries
+    timetraveller-install-system-cron resume <plan>       # uncomment block entries
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+
+# The only binary path we accept in cron entries we install. Hardcoded so
+# this helper can't be tricked into installing a cron entry that runs an
+# arbitrary script as root.
+ALLOWED_BINARY = "/usr/local/bin/timetraveller-backup"
+
+# Match each cron entry tightly: the standard 5 time-field charset, then our
+# allowed binary path, then a fixed --plan/--kind pair. No shell, no pipes,
+# no redirects, no extra args.
+ENTRY_RE = re.compile(
+    r"^"
+    r"(?P<min>[0-9*/,\-]+)\s+"
+    r"(?P<hr>[0-9*/,\-]+)\s+"
+    r"(?P<dom>[0-9*/,\-]+)\s+"
+    r"(?P<mon>[0-9*/,\-]+)\s+"
+    r"(?P<dow>[0-9*/,\-]+)\s+"
+    r"(?P<path>/[A-Za-z0-9_./\-]+/timetraveller-backup)\s+"
+    r"--plan\s+(?P<plan>[A-Za-z0-9_-]+)\s+"
+    r"--kind\s+(?P<kind>full|incr|auto)\s*"
+    r"$"
+)
+
+# Block markers we recognise as ours.
+START_MARKER_RE = re.compile(
+    r"^# >>> TimeTraveller managed: plan=(?P<plan>[A-Za-z0-9_-]+).*$"
+)
+END_MARKER_RE = re.compile(
+    r"^# <<< TimeTraveller managed: plan=(?P<plan>[A-Za-z0-9_-]+).*$"
+)
+
+ALLOWED_PLANS = {"system"}  # this helper only touches root's crontab for system plans
+ALLOWED_KINDS = {"full", "incr", "auto"}
+
+
+def fail(msg: str, code: int = 2) -> None:
+    print(f"timetraveller-install-system-cron: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def validate_plan_name(name: str) -> None:
+    if name not in ALLOWED_PLANS:
+        fail(f"refusing: plan name {name!r} not in allowed set {sorted(ALLOWED_PLANS)}")
+
+
+def validate_block(block_text: str, plan_name: str) -> None:
+    lines = block_text.splitlines()
+    if len(lines) < 2:
+        fail("refusing: managed block has fewer than 2 lines")
+
+    sm = START_MARKER_RE.match(lines[0])
+    if not sm:
+        fail("refusing: block does not start with a start marker")
+    if sm.group("plan") != plan_name:
+        fail(f"refusing: start marker plan name mismatch (got {sm.group('plan')!r}, expected {plan_name!r})")
+
+    em = END_MARKER_RE.match(lines[-1])
+    if not em:
+        fail("refusing: block does not end with an end marker")
+    if em.group("plan") != plan_name:
+        fail(f"refusing: end marker plan name mismatch (got {em.group('plan')!r}, expected {plan_name!r})")
+
+    for i, line in enumerate(lines[1:-1], start=2):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        m = ENTRY_RE.match(line)
+        if not m:
+            fail(f"refusing: line {i} does not match the strict pattern: {line!r}")
+        if m.group("path") != ALLOWED_BINARY:
+            fail(f"refusing: line {i} uses binary path {m.group('path')!r} (only {ALLOWED_BINARY!r} allowed)")
+        if m.group("plan") != plan_name:
+            fail(f"refusing: line {i} plan name {m.group('plan')!r} does not match block plan {plan_name!r}")
+        if m.group("kind") not in ALLOWED_KINDS:
+            fail(f"refusing: line {i} kind {m.group('kind')!r} not in {sorted(ALLOWED_KINDS)}")
+
+
+def read_root_crontab() -> str:
+    r = subprocess.run(["crontab", "-u", "root", "-l"], capture_output=True, text=True)
+    if r.returncode != 0 and "no crontab" not in (r.stderr or ""):
+        fail(f"could not read root's crontab: {r.stderr.strip()}", code=3)
+    return r.stdout or ""
+
+
+def write_root_crontab(text: str) -> None:
+    # Ensure trailing newline so cron parses the last line.
+    if not text.endswith("\n"):
+        text += "\n"
+    r = subprocess.run(
+        ["crontab", "-u", "root", "-"],
+        input=text, text=True, capture_output=True,
+    )
+    if r.returncode != 0:
+        fail(f"crontab install failed: {r.stderr.strip()}", code=3)
+
+
+_SUSPEND_PREFIX_RE = re.compile(r"^#\s*")
+
+
+def _is_entry_line(line: str) -> bool:
+    return bool(ENTRY_RE.match(line))
+
+
+def _stripped_entry_safe(line: str, plan_name: str) -> str | None:
+    """Return the stripped entry IF it's a commented-out, allowlist-passing
+    entry whose plan matches plan_name. Otherwise None.
+
+    The plan-name check is critical for the security guarantee — without it
+    we'd happily resume an entry that was injected for a different plan.
+    """
+    m = _SUSPEND_PREFIX_RE.match(line)
+    if not m:
+        return None
+    candidate = line[m.end():]
+    em = ENTRY_RE.match(candidate)
+    if not em:
+        return None
+    if em.group("path") != ALLOWED_BINARY:
+        return None
+    if em.group("plan") != plan_name:
+        return None
+    if em.group("kind") not in ALLOWED_KINDS:
+        return None
+    return candidate
+
+
+def transform_block_entries(crontab_text: str, plan_name: str, mode: str) -> str:
+    """Walk the managed block and transform its entry lines.
+
+    mode='suspend' prepends '# ' to each line passing ENTRY_RE.
+    mode='resume'  strips a leading '#\\s*' on lines that, after stripping,
+                   pass ENTRY_RE AND match this plan AND use the allowed binary.
+    """
+    lines = crontab_text.splitlines()
+    out: list[str] = []
+    in_block = False
+    saw_block = False
+    for line in lines:
+        if not in_block:
+            sm = START_MARKER_RE.match(line)
+            if sm and sm.group("plan") == plan_name:
+                in_block = True
+                saw_block = True
+                out.append(line)
+                continue
+            out.append(line)
+        else:
+            em = END_MARKER_RE.match(line)
+            if em and em.group("plan") == plan_name:
+                in_block = False
+                out.append(line)
+                continue
+            if mode == "suspend":
+                if _is_entry_line(line):
+                    out.append("# " + line)
+                else:
+                    out.append(line)
+            elif mode == "resume":
+                stripped = _stripped_entry_safe(line, plan_name)
+                out.append(stripped if stripped is not None else line)
+            else:
+                out.append(line)
+    if not saw_block:
+        fail(f"refusing: no managed block for plan {plan_name!r} in root's crontab", code=5)
+    return "\n".join(out).rstrip("\n") + ("\n" if out else "")
+
+
+def replace_block(crontab_text: str, plan_name: str, new_block: str | None) -> str:
+    """Same algorithm as timetraveller.schedule.replace_block, inlined for safety.
+
+    We don't import the project's module here so this helper has zero external
+    dependencies — it must remain auditable as a single file. new_block=None
+    means "remove the block, install nothing".
+    """
+    lines = crontab_text.splitlines()
+    out: list[str] = []
+    in_block = False
+    inserted = False
+    for line in lines:
+        if not in_block:
+            sm = START_MARKER_RE.match(line)
+            if sm and sm.group("plan") == plan_name:
+                in_block = True
+                continue
+            out.append(line)
+        else:
+            em = END_MARKER_RE.match(line)
+            if em and em.group("plan") == plan_name:
+                in_block = False
+                if new_block is not None:
+                    out.extend(new_block.rstrip("\n").splitlines())
+                    inserted = True
+            # else: drop the inner line
+
+    if new_block is not None and not inserted:
+        if out and out[-1].strip() != "":
+            out.append("")
+        out.extend(new_block.rstrip("\n").splitlines())
+
+    return "\n".join(out).rstrip("\n") + ("\n" if out else "")
+
+
+def main(argv: list[str]) -> int:
+    if os.geteuid() != 0:
+        fail("must be run as root (typically via pkexec)", code=4)
+
+    if len(argv) < 2 or argv[0] not in ("install", "uninstall", "suspend", "resume"):
+        fail("usage: {install <plan> [<block on stdin>] | uninstall <plan> "
+             "| suspend <plan> | resume <plan>}", code=64)
+
+    action = argv[0]
+    plan_name = argv[1]
+    validate_plan_name(plan_name)
+
+    current = read_root_crontab()
+
+    if action == "install":
+        new_block = sys.stdin.read()
+        if not new_block.strip():
+            fail("refusing: empty managed block on stdin", code=65)
+        validate_block(new_block, plan_name)
+        new_crontab = replace_block(current, plan_name, new_block)
+    elif action == "uninstall":
+        new_crontab = replace_block(current, plan_name, new_block=None)
+    elif action in ("suspend", "resume"):
+        new_crontab = transform_block_entries(current, plan_name, action)
+    else:
+        fail(f"unknown action {action!r}", code=64)
+
+    write_root_crontab(new_crontab)
+    print(f"ok: {action} {plan_name}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
