@@ -11,7 +11,9 @@ sidecar mirror — it never blocks the Qt thread on the backup mount.
 
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from pathlib import Path
+
+from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView, QHBoxLayout, QHeaderView, QLabel, QMessageBox,
     QPushButton, QSplitter, QTreeView, QTreeWidget, QTreeWidgetItem,
@@ -26,6 +28,31 @@ from .archive_tree_model import ArchiveTreeModel
 from .restore_dialog import RestoreDialog
 
 
+class _SidecarLoadWorker(QObject):
+    """Loads + parses an archive's .idx.zst sidecar off the Qt UI thread.
+
+    Sidecars for million-entry archives take a couple seconds to decompress
+    and JSON-parse; doing that on the UI thread freezes the window long
+    enough for the compositor to flag it as "Not Responding."
+    """
+
+    loaded = pyqtSignal(str, object)   # (archive_filename, IndexNode root)
+    failed = pyqtSignal(str, str)      # (archive_filename, error message)
+
+    def __init__(self, archive_filename: str, sidecar_path: Path):
+        super().__init__()
+        self._archive_filename = archive_filename
+        self._sidecar_path = sidecar_path
+
+    def run(self) -> None:
+        try:
+            root = load_sidecar_tree(self._sidecar_path)
+        except Exception as exc:  # noqa: BLE001 - surface every failure
+            self.failed.emit(self._archive_filename, f"{type(exc).__name__}: {exc}")
+            return
+        self.loaded.emit(self._archive_filename, root)
+
+
 class ArchivePanel(QWidget):
     """Browse and restore from archives belonging to a plan."""
 
@@ -36,6 +63,11 @@ class ArchivePanel(QWidget):
         self._plan: PlanConfig | None = None
         self._current_entry: ArchiveEntry | None = None
         self._tree_model: ArchiveTreeModel | None = None
+        self._load_thread: QThread | None = None
+        self._load_worker: _SidecarLoadWorker | None = None
+        # Tracks the archive whose sidecar load is currently in flight, so we
+        # can ignore late-arriving results from a previous selection.
+        self._pending_archive: str | None = None
 
         layout = QVBoxLayout(self)
 
@@ -145,6 +177,7 @@ class ArchivePanel(QWidget):
                 entry = data
         if entry is None:
             self._set_file_tree(None)
+            self._pending_archive = None
             return
         if self._current_entry and entry.filename == self._current_entry.filename:
             return
@@ -157,6 +190,7 @@ class ArchivePanel(QWidget):
                 f"<b>{entry.filename}</b> — no sidecar index (run --reindex)"
             )
             self._set_file_tree(None)
+            self._pending_archive = None
             return
 
         sc = sidecar_mirror_path(self._plan.plan_name, entry.filename)
@@ -166,21 +200,54 @@ class ArchivePanel(QWidget):
                 f"(run <code>--list-archives --refresh-from-mount</code>)"
             )
             self._set_file_tree(None)
+            self._pending_archive = None
             return
 
-        try:
-            root = load_sidecar_tree(sc)
-        except Exception as e:  # noqa: BLE001
-            QMessageBox.warning(self, "Could not read sidecar", f"{sc}\n\n{e}")
-            self._set_file_tree(None)
-            return
+        # Kick the actual sidecar load onto a worker thread so the UI stays
+        # responsive even on multi-million-entry sidecars.
+        self._archive_label.setText(
+            f"<b>{entry.filename}</b> &nbsp; — &nbsp; {_human(entry.size_bytes)} &nbsp; "
+            f"<i>(loading file tree…)</i>"
+        )
+        self._set_file_tree(None)
+        self._pending_archive = entry.filename
+        # If a previous load is still running, let it complete; we'll filter
+        # its result out via _pending_archive when it arrives.
+        self._load_thread = QThread(self)
+        self._load_worker = _SidecarLoadWorker(entry.filename, sc)
+        self._load_worker.moveToThread(self._load_thread)
+        self._load_thread.started.connect(self._load_worker.run)
+        self._load_worker.loaded.connect(self._on_sidecar_loaded)
+        self._load_worker.failed.connect(self._on_sidecar_failed)
+        self._load_worker.loaded.connect(self._load_thread.quit)
+        self._load_worker.failed.connect(self._load_thread.quit)
+        self._load_thread.finished.connect(self._load_worker.deleteLater)
+        self._load_thread.finished.connect(self._load_thread.deleteLater)
+        # Stash the entry so _on_sidecar_loaded can promote it to current.
+        self._loading_entry = entry
+        self._load_thread.start()
 
+    def _on_sidecar_loaded(self, archive_filename: str, root: IndexNode) -> None:
+        # Drop the result if the user clicked another archive while this one
+        # was loading — the more recent click set a different _pending_archive.
+        if archive_filename != self._pending_archive:
+            return
+        entry = self._loading_entry
         self._archive_label.setText(
             f"<b>{entry.filename}</b> &nbsp; — &nbsp; {_human(entry.size_bytes)} &nbsp; "
             f"({root.total_entries() - 1} entries)"
         )
         self._current_entry = entry
         self._set_file_tree(root)
+        self._pending_archive = None
+
+    def _on_sidecar_failed(self, archive_filename: str, msg: str) -> None:
+        if archive_filename != self._pending_archive:
+            return
+        sc = sidecar_mirror_path(self._plan.plan_name, archive_filename) if self._plan else "(?)"
+        QMessageBox.warning(self, "Could not read sidecar", f"{sc}\n\n{msg}")
+        self._set_file_tree(None)
+        self._pending_archive = None
 
     def _set_file_tree(self, root: IndexNode | None) -> None:
         if root is None:

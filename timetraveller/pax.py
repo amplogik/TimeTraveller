@@ -11,9 +11,12 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+
+from . import framewriter
 
 
 def glob_to_regexes(pattern: str) -> list[str]:
@@ -103,6 +106,7 @@ class PaxInvocation:
     compression: str = "zstd"
     one_filesystem: bool = True
     extra_pax_flags: list[str] = None  # type: ignore[assignment]
+    framed: bool = True      # emit framed zstd (.frames.json sidecar) for seekable restore
 
     def __post_init__(self):
         if self.extra_pax_flags is None:
@@ -298,6 +302,7 @@ class RunResult:
     archive_size: int
     duration_seconds: float
     file_count: int = 0   # only meaningful for run_with_file_list
+    frame_count: int = 0  # only meaningful when framed=True; 0 means unframed
 
     @property
     def status(self) -> str:
@@ -405,12 +410,33 @@ def run_with_file_list(invocation: PaxInvocation, file_iter,
             stderr=log_fp or subprocess.DEVNULL,
         )
         assert pax.stdin is not None and pax.stdout is not None
-        zstd = subprocess.Popen(
-            invocation.zstd_argv(),
-            stdin=pax.stdout,
-            stderr=log_fp or subprocess.DEVNULL,
-        )
-        pax.stdout.close()
+
+        frame_box: dict = {}
+        ft: threading.Thread | None = None
+        zstd: subprocess.Popen | None = None
+        if invocation.framed:
+            # Background thread reads pax.stdout, compresses 64 MiB at a time
+            # as independent zstd frames, writes archive + .frames.json sidecar.
+            def _frame_thread():
+                try:
+                    frame_box["result"] = framewriter.write_framed(
+                        pax.stdout, invocation.archive_path
+                    )
+                except BaseException as exc:  # propagate to main thread
+                    frame_box["error"] = exc
+                finally:
+                    pax.stdout.close()
+            ft = threading.Thread(target=_frame_thread, daemon=False)
+            ft.start()
+        else:
+            # Legacy single-frame mode: pipe pax.stdout directly into zstd.
+            zstd = subprocess.Popen(
+                invocation.zstd_argv(),
+                stdin=pax.stdout,
+                stderr=log_fp or subprocess.DEVNULL,
+            )
+            pax.stdout.close()
+
         # Stream filenames NUL-delimited. Python's BufferedWriter handles the
         # internal buffering; pax's pipe buffer (~64K) prevents us from racing
         # ahead too far before pax catches up.
@@ -420,8 +446,19 @@ def run_with_file_list(invocation: PaxInvocation, file_iter,
             write(b"\0")
             n += 1
         pax.stdin.close()
-        zstd_rc = zstd.wait()
-        pax_rc = pax.wait()
+
+        if ft is not None:
+            ft.join()
+            pax_rc = pax.wait()
+            if "error" in frame_box:
+                raise frame_box["error"]
+            frame_count = frame_box["result"]["frame_count"]
+            zstd_rc = 0
+        else:
+            assert zstd is not None
+            zstd_rc = zstd.wait()
+            pax_rc = pax.wait()
+            frame_count = 0
     finally:
         if log_fp:
             if n > 0:
@@ -438,6 +475,7 @@ def run_with_file_list(invocation: PaxInvocation, file_iter,
         archive_size=size,
         duration_seconds=duration,
         file_count=n,
+        frame_count=frame_count,
     )
 
 

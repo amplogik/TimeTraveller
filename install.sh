@@ -77,6 +77,12 @@ install -o root -g root -m 644 \
 echo "Installed Polkit policy."
 
 echo ""
+echo "Python dependency note:"
+echo "  TimeTraveller requires the 'zstandard' Python package for archive framing."
+echo "  On Ubuntu/Debian, prefer the distro package (system-managed Python on 24.04+ blocks pip):"
+echo "      sudo apt install python3-zstandard"
+echo "  If apt isn't an option:  pip install --user 'zstandard>=0.20'"
+echo ""
 echo "Done. Try:"
 echo "  timetraveller-backup --plan home --show-mounts"
 echo "  timetraveller-backup --plan home --show-schedule"

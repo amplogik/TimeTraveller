@@ -32,6 +32,7 @@ class ArchiveEntry:
     file_count: int | None = None
     notes: str = ""
     has_sidecar: bool = False   # True if the .idx.zst sidecar exists for this archive
+    has_frames: bool = False    # True if the .frames.json sidecar exists (framed-zstd archive)
 
 
 @dataclass

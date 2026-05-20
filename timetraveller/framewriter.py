@@ -1,0 +1,154 @@
+"""Framed zstd compression for seekable archives.
+
+Streams an input pipe through python-zstandard in fixed-size chunks, emitting
+each chunk as an independent zstd frame and recording its placement in a JSON
+sidecar. The resulting archive is byte-compatible with the standard zstd
+format: any `zstdcat` reads it as a concatenation of frames. The sidecar
+({archive}.frames.json) enables random-access readers to decompress only the
+frames they need.
+
+Sidecar schema (version 1):
+    {
+      "version": 1,
+      "frame_size": 67108864,
+      "zstd_level": 3,
+      "total_uncompressed": <int>,
+      "total_compressed": <int>,
+      "elapsed_seconds": <float>,
+      "frame_count": <int>,
+      "frames": [{"id": <int>, "uo": <int>, "ul": <int>,
+                  "co": <int>, "cl": <int>}, ...]
+    }
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+from pathlib import Path
+from typing import BinaryIO
+
+try:
+    import zstandard as zstd
+except ImportError as e:  # pragma: no cover
+    raise ImportError(
+        "framewriter requires the 'zstandard' package. Install with:\n"
+        "    sudo apt install python3-zstandard   # Ubuntu/Debian (preferred)\n"
+        "    pip install --user 'zstandard>=0.20'  # fallback"
+    ) from e
+
+
+FRAME_SIZE = 64 * 1024 * 1024
+FLUSH_EVERY = 64
+
+
+def sidecar_path(archive_path: Path) -> Path:
+    return archive_path.with_name(archive_path.name + ".frames.json")
+
+
+def partial_sidecar_path(archive_path: Path) -> Path:
+    return archive_path.with_name(archive_path.name + ".frames.json.partial")
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    staging = path.with_name(path.name + ".staging")
+    data = json.dumps(payload).encode("utf-8")
+    with open(staging, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(staging, path)
+
+
+def write_framed(
+    input_stream: BinaryIO,
+    archive_path: Path,
+    *,
+    zstd_level: int = 3,
+    frame_size: int = FRAME_SIZE,
+    flush_every: int = FLUSH_EVERY,
+) -> dict:
+    """Stream `input_stream` to `archive_path` as a series of independent zstd
+    frames; emit `<archive_path>.frames.json` alongside on clean exit.
+
+    Returns the final frame-index dict.
+
+    On a mid-run crash, the partial sidecar at `<archive_path>.frames.json.partial`
+    holds the index up to the last flush boundary. Callers can detect this by
+    checking for the partial file's presence after a failed run.
+    """
+    started = time.monotonic()
+    compressor = zstd.ZstdCompressor(level=zstd_level)
+
+    frames: list[dict] = []
+    total_uncompressed = 0
+    total_compressed = 0
+
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    partial_path = partial_sidecar_path(archive_path)
+    final_path = sidecar_path(archive_path)
+
+    def snapshot() -> dict:
+        return {
+            "version": 1,
+            "frame_size": frame_size,
+            "zstd_level": zstd_level,
+            "total_uncompressed": total_uncompressed,
+            "total_compressed": total_compressed,
+            "elapsed_seconds": time.monotonic() - started,
+            "frame_count": len(frames),
+            "frames": frames,
+        }
+
+    with open(archive_path, "wb") as out:
+        while True:
+            chunk = _read_full(input_stream, frame_size)
+            if not chunk:
+                break
+            compressed = compressor.compress(chunk)
+
+            frames.append({
+                "id": len(frames),
+                "uo": total_uncompressed,
+                "ul": len(chunk),
+                "co": total_compressed,
+                "cl": len(compressed),
+            })
+
+            out.write(compressed)
+            total_uncompressed += len(chunk)
+            total_compressed += len(compressed)
+
+            if len(frames) % flush_every == 0:
+                _atomic_write_json(partial_path, snapshot())
+
+        out.flush()
+        os.fsync(out.fileno())
+
+    final = snapshot()
+    _atomic_write_json(final_path, final)
+
+    try:
+        partial_path.unlink()
+    except FileNotFoundError:
+        pass
+
+    return final
+
+
+def _read_full(stream: BinaryIO, n: int) -> bytes:
+    """Read up to n bytes, returning a full chunk unless EOF.
+
+    A single stream.read(n) on a pipe can return fewer bytes than requested
+    even when more data is coming — this loops until either n bytes are read
+    or the stream closes, so frames are exactly `frame_size` apart in the
+    uncompressed domain (except the last).
+    """
+    out = bytearray()
+    while len(out) < n:
+        piece = stream.read(n - len(out))
+        if not piece:
+            break
+        out.extend(piece)
+    return bytes(out)

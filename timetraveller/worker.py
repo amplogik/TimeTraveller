@@ -15,6 +15,8 @@ from pathlib import Path
 
 from . import archive as archivelib
 from . import config as configlib
+from . import extract as extractlib
+from . import framewriter
 from . import index as indexlib
 from . import manifest as manifestlib
 from . import mounts as mountslib
@@ -64,6 +66,12 @@ def build_parser() -> argparse.ArgumentParser:
                               "Pass an archive filename to force-regenerate one.")
     actions.add_argument("--verify", type=str, default=None,
                          help="Stream the named archive through pax -r to /dev/null to check integrity.")
+    actions.add_argument("--extract", type=str, default=None, metavar="ARCHIVE",
+                         help="Restore files or subtrees from the named archive into --into "
+                              "(default: cwd). Positional args are paths within the archive; "
+                              "a trailing slash means subtree. Uses .idx.zst + .frames.json "
+                              "sidecars when available for fast random-access extraction; "
+                              "falls back to whole-archive scan otherwise.")
     actions.add_argument("--prune", action="store_true",
                          help="Apply retention without taking a new backup.")
     actions.add_argument("--show-schedule", action="store_true",
@@ -115,11 +123,19 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Override the config destination for this run.")
     p.add_argument("--no-retention", action="store_true",
                    help="Skip the retention pass after this run.")
+    p.add_argument("--no-framed", action="store_true",
+                   help="Disable framed-zstd output for this run. Single-file restore "
+                        "from the resulting archive will require a full archive read.")
     p.add_argument("--manual", action="store_true",
                    help="Mark this as a manual (not scheduled) run; uses HHMMSS in the filename "
                         "to avoid colliding with same-day scheduled runs.")
     p.add_argument("--log-file", type=Path, default=None,
                    help="Append pax/zstd stderr to this file.")
+    p.add_argument("--into", type=Path, default=None,
+                   help="With --extract: destination directory. Defaults to cwd.")
+    p.add_argument("paths", nargs="*",
+                   help="With --extract: archive paths to restore. "
+                        "`./etc/fstab` extracts one file; `./etc/` extracts a subtree.")
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--verbose", "-v", action="store_true")
     return p
@@ -227,6 +243,17 @@ def _log(args: argparse.Namespace, msg: str) -> None:
         print(msg, flush=True)
 
 
+def _hms(seconds: float) -> str:
+    s = int(round(seconds))
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
 def _save_manifest(m: manifestlib.Manifest, archive_dir: Path, plan_name: str) -> None:
     """Persist the manifest to the on-mount location and the local mirror.
 
@@ -275,14 +302,29 @@ def action_list_archives(args: argparse.Namespace, plan: configlib.PlanConfig) -
 
     if args.refresh_from_mount:
         on_mount = manifestlib.load(manifestlib.manifest_path(archive_dir))
-        # Backfill has_sidecar from disk and seed the local sidecar mirror
-        # while we're already touching the mount.
+        # Backfill has_sidecar / has_frames from disk and seed the local sidecar
+        # mirror while we're already touching the mount.
         for entry in on_mount.archives:
             sc = indexlib.sidecar_path(archive_dir / entry.filename)
             entry.has_sidecar = sc.exists()
             if entry.has_sidecar:
                 _mirror_sidecar(plan.plan_name, sc, entry.filename)
-        _save_manifest(on_mount, archive_dir, plan.plan_name)
+            entry.has_frames = framewriter.sidecar_path(archive_dir / entry.filename).exists()
+        # Try to persist backfilled flags to the on-mount manifest so other
+        # machines / users running --refresh-from-mount see them. For a system
+        # plan whose archive_dir is owned by root, this write will fail when
+        # the GUI user runs without sudo — that's OK, the local mirror is
+        # what the GUI actually reads. Skip the on-mount write in that case
+        # and update the mirror directly.
+        try:
+            _save_manifest(on_mount, archive_dir, plan.plan_name)
+        except PermissionError:
+            print(f"NOTE: on-mount manifest not writable as this user; "
+                  f"updating local mirror only.", file=sys.stderr)
+            try:
+                manifestlib.save(on_mount, manifestlib.mirror_manifest_path(plan.plan_name))
+            except OSError as e:
+                print(f"WARNING: local mirror update failed: {e}", file=sys.stderr)
 
     mirror = manifestlib.mirror_manifest_path(plan.plan_name)
     if not mirror.exists():
@@ -364,6 +406,7 @@ def action_dry_run(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
         compression=plan.compression,
         one_filesystem=True,
         extra_pax_flags=plan.extra_pax_flags,
+        framed=plan.framed and not args.no_framed,
     )
 
     print(f"Plan:        {plan.plan_name}")
@@ -474,6 +517,42 @@ def action_reindex(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
             entry.has_sidecar = True
         _mirror_sidecar(plan.plan_name, indexlib.sidecar_path(a), a.name)
     _save_manifest(m, archive_dir, plan.plan_name)
+    return 0
+
+
+def action_extract(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
+    archive = plan.archive_dir() / args.extract
+    if not archive.exists():
+        print(f"archive not found: {archive}", file=sys.stderr)
+        return 1
+    if not args.paths:
+        print("--extract: at least one path argument is required.\n"
+              "  Examples:\n"
+              "    --extract ARCHIVE ./etc/fstab           # single file\n"
+              "    --extract ARCHIVE ./etc/                # subtree\n"
+              "    --extract ARCHIVE --into /tmp/r ./var/log/syslog",
+              file=sys.stderr)
+        return 1
+    into = args.into if args.into is not None else Path.cwd()
+
+    stats = extractlib.extract_files(archive, list(args.paths), into=into)
+
+    if stats.matched_files + stats.matched_dirs + stats.matched_symlinks == 0:
+        print(f"--extract: no matching entries in {archive.name}", file=sys.stderr)
+        return 1
+
+    mode = "naive (whole-archive scan)" if stats.fallback_naive else "fast (sidecar-based)"
+    _log(args, f"--extract mode: {mode}")
+    _log(args, f"  patterns: {stats.requested_patterns}, "
+               f"files: {stats.matched_files}, dirs: {stats.matched_dirs}, "
+               f"symlinks: {stats.matched_symlinks}"
+               + (f", hardlinks skipped: {stats.matched_hardlinks}"
+                  if stats.matched_hardlinks else ""))
+    if not stats.fallback_naive:
+        _log(args, f"  frames read: {stats.frames_read} "
+                   f"({stats.nfs_bytes_read/1024**2:.1f} MiB from archive)")
+    _log(args, f"  bytes written: {stats.bytes_written:,}")
+    _log(args, f"  elapsed: {_hms(stats.seconds_total)}")
     return 0
 
 
@@ -810,6 +889,12 @@ def action_backup(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
 
     sources_rel, chdir = _relative_sources(plan.sources)
 
+    framed = plan.framed and not args.no_framed
+    if not framed:
+        print("WARNING: framing disabled — single-file restore from this archive "
+              "will require a full archive read (can be many hours on large archives).",
+              file=sys.stderr)
+
     inv = paxlib.PaxInvocation(
         sources=sources_rel,
         chdir=chdir,
@@ -820,6 +905,7 @@ def action_backup(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
         compression=plan.compression,
         one_filesystem=True,
         extra_pax_flags=plan.extra_pax_flags,
+        framed=framed,
     )
 
     hostname = socket.gethostname()
@@ -865,15 +951,17 @@ def action_backup(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
     finished = datetime.now(timezone.utc)
 
     status = result.status
-    m.update_status(
-        fname,
-        status=status,
-        date_finished=finished.isoformat(),
-        size_bytes=result.archive_size,
-    )
-    _save_manifest(m, archive_dir, plan.plan_name)
 
     if status == "failed":
+        # Record the failure immediately so the manifest reflects the on-disk
+        # state (renamed-to-.failed) even if the worker is killed right after.
+        m.update_status(
+            fname,
+            status=status,
+            date_finished=finished.isoformat(),
+            size_bytes=result.archive_size,
+        )
+        _save_manifest(m, archive_dir, plan.plan_name)
         print(f"ERROR: pax={result.pax_returncode} zstd={result.zstd_returncode}; "
               f"see {log_path}", file=sys.stderr)
         # Leave a marker file so the GUI surfaces it.
@@ -887,16 +975,14 @@ def action_backup(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
         print(f"WARNING: pax={result.pax_returncode} (non-fatal — archive is trustworthy); "
               f"see {log_path}", file=sys.stderr)
 
-    _log(args, f"Archive: {result.archive_size/1024**2:.1f} MiB in {result.duration_seconds:.1f}s")
+    _log(args, f"Archive written: {result.archive_size/1024**2:.1f} MiB "
+               f"in {_hms(result.duration_seconds)} (sidecar pending)")
 
+    has_sidecar = False
     try:
         indexlib.write_sidecar(archive_path)
+        has_sidecar = True
         _log(args, "Sidecar index written.")
-        for entry in m.archives:
-            if entry.filename == fname:
-                entry.has_sidecar = True
-                break
-        _save_manifest(m, archive_dir, plan.plan_name)
         _mirror_sidecar(plan.plan_name, indexlib.sidecar_path(archive_path), fname)
     except Exception as e:  # noqa: BLE001 - sidecar failure shouldn't fail the backup
         print(f"WARNING: sidecar generation failed: {e}", file=sys.stderr)
@@ -905,6 +991,26 @@ def action_backup(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
         prune_args = argparse.Namespace(**vars(args))
         action_prune(prune_args, plan)
 
+    # Persist final state with the true completion time, now that the sidecar
+    # pass and retention are done. `date_finished` reflects the moment the
+    # backup is genuinely complete, not just the archive-write phase.
+    m.update_status(
+        fname,
+        status=status,
+        date_finished=datetime.now(timezone.utc).isoformat(),
+        size_bytes=result.archive_size,
+    )
+    for entry in m.archives:
+        if entry.filename == fname:
+            if result.frame_count > 0:
+                entry.has_frames = True
+            if has_sidecar:
+                entry.has_sidecar = True
+            break
+    _save_manifest(m, archive_dir, plan.plan_name)
+
+    total = (datetime.now(timezone.utc) - now).total_seconds()
+    _log(args, f"Backup complete: {_hms(total)} total.")
     return 0
 
 
@@ -968,6 +1074,8 @@ def main(argv: list[str] | None = None) -> int:
         return action_reindex(args, plan)
     if args.verify:
         return action_verify(args, plan)
+    if args.extract:
+        return action_extract(args, plan)
     if args.prune:
         return action_prune(args, plan)
     if args.show_schedule:

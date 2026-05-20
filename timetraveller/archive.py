@@ -6,9 +6,11 @@ so it can be tested without spinning up QApplication.
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import index as indexlib
@@ -44,11 +46,13 @@ class IndexNode:
     full_path: str            # e.g. "./home/kim/foo.txt"
     is_dir: bool
     size: int = 0
-    mtime: str = ""           # raw "May 17 20:50" or "May 17 2024" form from pax -tv
-    perms: str = ""           # e.g. "-rwsr-x---"
+    mtime: str = ""           # display string; v1 from `tar -tv`, v2 formatted from epoch
+    perms: str = ""           # e.g. "-rwsr-x---"; empty when loaded from a v2 sidecar
     owner: str = ""
     group: str = ""
     symlink_target: str = ""  # populated for symlinks
+    header_offset: int = 0    # uncompressed byte offset of the tar header (v2 only)
+    data_offset: int = 0      # uncompressed byte offset of file body (v2 only)
     children: dict[str, "IndexNode"] = field(default_factory=dict)
 
     def sorted_children(self) -> list["IndexNode"]:
@@ -68,14 +72,98 @@ class IndexNode:
 def parse_index(text: str) -> IndexNode:
     """Parse the contents of a .idx.zst sidecar (decompressed) into a tree.
 
-    Robust to:
-      - Directory entries that appear in any order relative to their children.
-        (We synthesize a placeholder dir node when we see a child first.)
-      - The trailing `pax: ustar vol 1, N files, ...` line.
-      - Symlink targets after ` -> `.
-      - Filenames containing spaces.
+    Format autodetect: the v2 format begins with a `{` (JSONL header object);
+    everything else is treated as legacy v1 plain-text from `tar -tv`.
     """
+    stripped = text.lstrip()
+    if stripped.startswith("{"):
+        return _parse_index_v2(text)
     return parse_index_lines(text.splitlines())
+
+
+def _parse_index_v2(text: str) -> IndexNode:
+    """Parse a v2 (JSONL) sidecar.
+
+    First non-empty line is the header object; remaining lines are
+    per-member records. See index.py for the schema."""
+    root = IndexNode(name="", full_path=".", is_dir=True)
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        rec = json.loads(line)
+        if "version" in rec:
+            continue
+        _add_v2_record(root, rec)
+    return root
+
+
+def _add_v2_record(root: IndexNode, rec: dict) -> None:
+    path = rec.get("name", "")
+    if not path or path in (".", "./"):
+        return
+    if path.endswith("/") and len(path) > 1:
+        path = path[:-1]
+
+    type_char = rec.get("type", "f")
+    is_dir = (type_char == "d")
+    is_symlink = (type_char == "l")
+
+    rel = path[2:] if path.startswith("./") else path.lstrip("/")
+    parts = rel.split("/")
+    if not parts or parts == [""]:
+        return
+
+    node = root
+    for i, part in enumerate(parts[:-1]):
+        child = node.children.get(part)
+        if child is None:
+            child = IndexNode(
+                name=part,
+                full_path="./" + "/".join(parts[: i + 1]),
+                is_dir=True,
+            )
+            node.children[part] = child
+        elif not child.is_dir:
+            child.is_dir = True
+        node = child
+
+    leaf = parts[-1]
+    mtime_str = _format_mtime(rec.get("mtime", 0))
+    metadata = dict(
+        size=int(rec.get("size", 0)),
+        mtime=mtime_str,
+        perms="",
+        owner=rec.get("uname", ""),
+        group=rec.get("gname", ""),
+        symlink_target=rec.get("link_target", "") if is_symlink else "",
+        header_offset=int(rec.get("header_offset", 0)),
+        data_offset=int(rec.get("data_offset", 0)),
+    )
+    if leaf in node.children:
+        existing = node.children[leaf]
+        for k, v in metadata.items():
+            setattr(existing, k, v)
+        if is_dir:
+            existing.is_dir = True
+    else:
+        node.children[leaf] = IndexNode(
+            name=leaf, full_path=path, is_dir=is_dir, **metadata,
+        )
+
+
+def _format_mtime(epoch: int) -> str:
+    """Format an epoch timestamp as YYYY-MM-DD HH:MM in UTC.
+
+    Matches the v1 layout (`tar -tv` ISO date + HH:MM) so the GUI doesn't
+    need to know which sidecar format produced the tree.
+    """
+    if not epoch:
+        return ""
+    try:
+        return datetime.fromtimestamp(int(epoch), tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+    except (ValueError, OSError):
+        return ""
 
 
 def parse_index_lines(lines: list[str]) -> IndexNode:

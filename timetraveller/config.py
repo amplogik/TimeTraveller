@@ -78,6 +78,7 @@ class PlanConfig:
     include_mounts: list[str] = field(default_factory=list)
     exclude_mounts: list[str] = field(default_factory=list)
     compression: str = "zstd"
+    framed: bool = True
     extra_pax_flags: list[str] = field(default_factory=list)
 
     def validate(self) -> None:
@@ -229,6 +230,8 @@ _SYSTEM_EXCLUDES = [
     "/home/**",
     "/mnt/**",
     "/media/**",
+    "/cdrom/**",
+    "/snap/**",
     "/proc/**",
     "/sys/**",
     "/dev/**",
@@ -254,7 +257,7 @@ def defaults_home() -> PlanConfig:
 def defaults_system() -> PlanConfig:
     return PlanConfig(
         plan_name="system",
-        sources=["/"],
+        sources=["/", "/boot/efi"],
         excludes=list(_SYSTEM_EXCLUDES),
     )
 
