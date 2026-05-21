@@ -1,0 +1,43 @@
+Source: timetraveller
+Section: utils
+Priority: optional
+Maintainer: Kim McCann <amplogik@gmail.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ dh-python,
+ python3-all,
+ python3-setuptools,
+ pybuild-plugin-pyproject
+Standards-Version: 4.6.2
+Homepage: https://github.com/amplogik/TimeTraveller
+Vcs-Browser: https://github.com/amplogik/TimeTraveller
+Vcs-Git: https://github.com/amplogik/TimeTraveller.git
+Rules-Requires-Root: no
+
+Package: timetraveller
+Architecture: all
+Depends:
+ ${misc:Depends},
+ python3 (>= 3.11),
+ python3-yaml,
+ python3-zstandard,
+ python3-pyqt6,
+ pax,
+ zstd,
+ polkitd | policykit-1
+Recommends: cron
+Description: Local Linux backup tool with seekable pax+zstd archives
+ TimeTraveller is a local backup tool focused on trustworthy backups and
+ fast, partial recovery.
+ .
+ Each backup is a pax archive compressed with zstd, alongside a small
+ sidecar index that enables single-file restore in seconds — no need to
+ scan the whole archive. Plans run on a cron schedule or manually; the
+ GUI lets you browse archive contents and restore individual files,
+ directories, or arbitrary selections.
+ .
+ Features include incremental backups with cycle-aware retention, glob
+ patterns for excludes, explicit handling of nested mount points, and
+ NAS destinations over NFS. Two plan types are supported: Active
+ (scheduled, with retention) and Archive (manual, keep-forever for
+ rarely-changing data).

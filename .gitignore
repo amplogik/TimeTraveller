@@ -6,3 +6,15 @@ build/
 dist/
 .venv/
 .claude/
+
+# debian packaging build artifacts
+debian/.debhelper/
+debian/debhelper-build-stamp
+debian/files
+debian/*.substvars
+debian/*.debhelper.log
+debian/timetraveller/
+.pybuild/
+*.deb
+*.buildinfo
+*.changes

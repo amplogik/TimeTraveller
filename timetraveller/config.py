@@ -9,9 +9,9 @@ from pathlib import Path
 import yaml
 
 WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
-RETENTION_POLICIES = ("max_cycles", "max_age_days", "max_size_gb")
+RETENTION_POLICIES = ("max_cycles", "max_age_days", "max_size_gb", "keep_all")
 COMPRESSIONS = ("zstd", "gzip", "none")
-SCHEDULE_MODES = ("weekly", "monthly")
+SCHEDULE_MODES = ("weekly", "monthly", "archive")
 INCR_MODES = ("weekdays", "except_full", "every_n_days", "disabled")
 
 

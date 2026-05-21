@@ -13,13 +13,14 @@ from pathlib import Path
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction, QKeySequence
 from PyQt6.QtWidgets import (
-    QInputDialog, QListWidget, QMainWindow, QMessageBox, QSplitter, QStatusBar,
-    QTabWidget, QToolBar, QWidget,
+    QInputDialog, QLabel, QListWidget, QMainWindow, QMessageBox, QSizePolicy,
+    QSplitter, QStatusBar, QTabWidget, QToolBar, QVBoxLayout, QWidget,
 )
 
 from .. import config as configlib
 from ..config import PlanConfig
 from .archive_panel import ArchivePanel
+from .help_dialog import HelpDialog
 from .plan_panel import PlanPanel
 from .run_dialog import WorkerRunDialog
 from .schedule_panel import SchedulePanel
@@ -40,7 +41,7 @@ class MainWindow(QMainWindow):
         tb.setMovable(False)
         self.addToolBar(tb)
 
-        self._save_act = QAction("Save", self)
+        self._save_act = QAction("Save Plan", self)
         self._save_act.setShortcut(QKeySequence.StandardKey.Save)
         self._save_act.triggered.connect(self._save_current_plan)
         tb.addAction(self._save_act)
@@ -78,20 +79,56 @@ class MainWindow(QMainWindow):
                               "--list-archives"]))
         tb.addAction(self._archives_act)
 
-        tb.addSeparator()
+        self._help_act = QAction("Help", self)
+        self._help_act.setShortcut(QKeySequence.StandardKey.HelpContents)
+        self._help_act.triggered.connect(self._show_help)
+        tb.addAction(self._help_act)
 
-        self._new_plan_act = QAction("New plan…", self)
+        self._remove_plan_act = QAction("Remove Plan…", self)
+        self._remove_plan_act.triggered.connect(self._on_remove_plan_request)
+        tb.addAction(self._remove_plan_act)
+        # Red tint so the destructive action is unmistakable.
+        remove_btn = tb.widgetForAction(self._remove_plan_act)
+        if remove_btn is not None:
+            remove_btn.setStyleSheet(
+                "QToolButton { color: #cf222e; font-weight: bold; }"
+                "QToolButton:hover { background: rgba(207, 34, 46, 0.12); }"
+            )
+
+        # Push New plan to the right edge — it's the one action that doesn't
+        # operate on the currently-selected plan, so visually setting it apart
+        # helps avoid accidental clicks.
+        tb_spacer = QWidget()
+        tb_spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        tb.addWidget(tb_spacer)
+
+        self._new_plan_act = QAction("+ New plan…", self)
         self._new_plan_act.triggered.connect(self._new_plan)
         tb.addAction(self._new_plan_act)
+        # Green tint so the create action is unmistakable in the toolbar.
+        new_plan_btn = tb.widgetForAction(self._new_plan_act)
+        if new_plan_btn is not None:
+            new_plan_btn.setStyleSheet(
+                "QToolButton { color: #2da44e; font-weight: bold; }"
+                "QToolButton:hover { background: rgba(45, 164, 78, 0.12); }"
+            )
 
         # ----- central splitter -----
         splitter = QSplitter(Qt.Orientation.Horizontal)
         self.setCentralWidget(splitter)
 
         self._plan_list = QListWidget()
-        self._plan_list.setMaximumWidth(220)
         self._plan_list.currentTextChanged.connect(self._on_plan_selected)
-        splitter.addWidget(self._plan_list)
+
+        plans_container = QWidget()
+        plans_container.setMaximumWidth(220)
+        pcl = QVBoxLayout(plans_container)
+        pcl.setContentsMargins(0, 0, 0, 0)
+        plans_header = QLabel("<b>Backup Plans</b>")
+        plans_header.setStyleSheet("padding: 6px 8px;")
+        pcl.addWidget(plans_header)
+        pcl.addWidget(self._plan_list, 1)
+        splitter.addWidget(plans_container)
 
         self._tabs = QTabWidget()
         self._plan_panel = PlanPanel()
@@ -104,6 +141,7 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
 
         self._plan_panel.changed.connect(self._mark_dirty)
+        self._plan_panel.switch_type_requested.connect(self._on_switch_type_request)
         self._schedule_panel.changed.connect(self._mark_dirty)
         self._schedule_panel.install_requested.connect(self._on_install_request)
         self._schedule_panel.suspend_requested.connect(self._on_suspend_request)
@@ -131,25 +169,32 @@ class MainWindow(QMainWindow):
     def _discover_plans(self) -> None:
         self._plan_list.clear()
         self._plans.clear()
-        # User configs.
+        # Build a name → effective path map mirroring resolve_config_path:
+        # for "system", the /etc path wins; for every other plan name, the
+        # user path wins. Without this dedupe a user-level system.yaml and a
+        # system-level system.yaml both showed up in the list pointing at the
+        # same selection.
+        candidates: dict[str, Path] = {}
         user_dir = configlib.user_config_path("dummy").parent
         if user_dir.exists():
             for f in sorted(user_dir.glob("*.yaml")):
-                try:
-                    plan = configlib.load(f)
-                    self._plans[plan.plan_name] = plan
-                    self._plan_list.addItem(plan.plan_name)
-                except Exception as e:  # noqa: BLE001
-                    self.statusBar().showMessage(f"Skipped {f}: {e}", 5000)
-        # System config.
+                candidates[f.stem] = f
         sysp = configlib.system_config_path("system")
         if sysp.exists() and os.access(sysp, os.R_OK):
+            shadowed = candidates.get("system")
+            candidates["system"] = sysp
+            if shadowed is not None and shadowed != sysp:
+                self.statusBar().showMessage(
+                    f"Note: {shadowed} is shadowed by {sysp}", 5000,
+                )
+        for name in sorted(candidates):
+            path = candidates[name]
             try:
-                plan = configlib.load(sysp)
+                plan = configlib.load(path)
                 self._plans[plan.plan_name] = plan
                 self._plan_list.addItem(plan.plan_name)
             except Exception as e:  # noqa: BLE001
-                self.statusBar().showMessage(f"Skipped {sysp}: {e}", 5000)
+                self.statusBar().showMessage(f"Skipped {path}: {e}", 5000)
 
     def _on_plan_selected(self, name: str) -> None:
         if not name:
@@ -173,7 +218,8 @@ class MainWindow(QMainWindow):
         self._set_actions_enabled(True)
 
     def _set_actions_enabled(self, enabled: bool) -> None:
-        for act in (self._save_act, self._run_full_act, self._run_incr_act,
+        for act in (self._save_act, self._remove_plan_act,
+                    self._run_full_act, self._run_incr_act,
                     self._dry_run_act, self._mounts_act, self._archives_act):
             act.setEnabled(enabled)
 
@@ -305,6 +351,197 @@ class MainWindow(QMainWindow):
             return not self._dirty
         return False
 
+    # ---------- plan type switch ----------
+
+    def _on_switch_type_request(self) -> None:
+        """Handle the Plan-type Change… button from PlanPanel."""
+        if not self._current_plan_name:
+            return
+        plan = self._plans.get(self._current_plan_name)
+        if plan is None:
+            return
+
+        # Switching rewrites the YAML on disk, so any unsaved in-panel edits
+        # would either be overwritten or fight with the new state. Require a
+        # clean state first.
+        if self._dirty:
+            QMessageBox.information(
+                self, "Save or discard first",
+                "Please save or discard your unsaved edits before switching "
+                "the plan type.",
+            )
+            return
+
+        is_archive = plan.schedule.mode == "archive"
+        if is_archive:
+            self._switch_to_active(plan)
+        else:
+            self._switch_to_archive(plan)
+
+    def _switch_to_archive(self, plan: configlib.PlanConfig) -> None:
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setWindowTitle("Switch to Archive plan?")
+        msg.setTextFormat(Qt.TextFormat.RichText)
+        msg.setText(
+            f"<b>Switch plan {plan.plan_name!r} to Archive?</b>"
+        )
+        msg.setInformativeText(
+            "All cycles <b>except the most recent</b> will be permanently "
+            "deleted from disk. The remaining cycle becomes the archive basis. "
+            "<br><br>"
+            "After the switch:"
+            "<ul>"
+            "<li>The plan will not be scheduled (no cron entries).</li>"
+            "<li>Retention is set to <i>keep_all</i> — no automatic pruning.</li>"
+            "<li>You can still run manual fulls and incrementals.</li>"
+            "</ul>"
+            "<b>This cannot be undone.</b>"
+        )
+        proceed_btn = msg.addButton("Switch to Archive", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_btn = msg.addButton(QMessageBox.StandardButton.Cancel)
+        msg.setDefaultButton(cancel_btn)
+        msg.exec()
+        if msg.clickedButton() is not proceed_btn:
+            return
+
+        args = [
+            "--plan", plan.plan_name,
+            "--config", str(self._config_path_for(plan.plan_name)),
+            "--switch-to-archive",
+        ]
+        self._spawn_worker(f"Switch {plan.plan_name} to Archive", args)
+        self._reload_after_switch()
+
+    def _switch_to_active(self, plan: configlib.PlanConfig) -> None:
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setWindowTitle("Switch to Active plan?")
+        msg.setTextFormat(Qt.TextFormat.RichText)
+        msg.setText(
+            f"<b>Switch plan {plan.plan_name!r} to Active?</b>"
+        )
+        msg.setInformativeText(
+            "The plan will be put on a weekly schedule with default retention "
+            "(<i>max_cycles=4</i>). Existing cycles on disk are preserved."
+            "<br><br>"
+            "<b>Heads up:</b> if the existing full is old, your archive basis "
+            "may age out under retention before a new full is taken. Consider "
+            "running a new full backup soon after the switch."
+        )
+        proceed_btn = msg.addButton("Switch to Active", QMessageBox.ButtonRole.AcceptRole)
+        cancel_btn = msg.addButton(QMessageBox.StandardButton.Cancel)
+        msg.setDefaultButton(cancel_btn)
+        msg.exec()
+        if msg.clickedButton() is not proceed_btn:
+            return
+
+        args = [
+            "--plan", plan.plan_name,
+            "--config", str(self._config_path_for(plan.plan_name)),
+            "--switch-to-active",
+        ]
+        self._spawn_worker(f"Switch {plan.plan_name} to Active", args)
+        self._reload_after_switch()
+
+    def _reload_after_switch(self) -> None:
+        """Re-read plans from disk and reload the panels for the current plan."""
+        current = self._current_plan_name
+        self._discover_plans()
+        if current:
+            items = self._plan_list.findItems(current, Qt.MatchFlag.MatchExactly)
+            if items:
+                self._plan_list.setCurrentItem(items[0])
+            plan = self._plans.get(current)
+            if plan is not None:
+                self._plan_panel.load_plan(plan)
+                self._schedule_panel.load_plan(plan)
+                self._archive_panel.load_plan(plan)
+        self._dirty = False
+        self._update_status()
+
+    # ---------- help ----------
+
+    def _show_help(self) -> None:
+        dlg = HelpDialog(self)
+        dlg.exec()
+
+    # ---------- remove plan ----------
+
+    def _on_remove_plan_request(self) -> None:
+        if not self._current_plan_name:
+            return
+        plan = self._plans.get(self._current_plan_name)
+        if plan is None:
+            return
+
+        # System plans live in /etc/timetraveller/ and require root to delete.
+        # Rather than silently disabling the button, give the user a concrete
+        # next step.
+        if plan.plan_name == "system":
+            path = self._config_path_for(plan.plan_name)
+            QMessageBox.information(
+                self, "Cannot remove system plan",
+                f"System plans live in <code>/etc/timetraveller/</code>. "
+                f"This GUI cannot write there. Remove it as root:<br><br>"
+                f"<code>sudo rm {path}</code><br><br>"
+                f"Then also uninstall its cron entries:<br>"
+                f"<code>sudo timetraveller-backup --plan system "
+                f"--uninstall-schedule</code>",
+            )
+            return
+
+        archive_dir = plan.archive_dir()
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setWindowTitle(f"Remove plan {plan.plan_name!r}?")
+        msg.setTextFormat(Qt.TextFormat.RichText)
+        msg.setText(f"<b>Remove plan {plan.plan_name!r}?</b>")
+        msg.setInformativeText(
+            "This will uninstall its schedule (if any), clear its local cache, "
+            "and delete its config file."
+            "<br><br>"
+            f"Backup archives at <code>{archive_dir}</code> can be kept on "
+            "disk (you can browse to them manually) or deleted now."
+        )
+        # Cancel | Keep backups | Delete backups (destructive).
+        cancel_btn = msg.addButton(QMessageBox.StandardButton.Cancel)
+        keep_btn = msg.addButton("Remove plan, keep backups",
+                                 QMessageBox.ButtonRole.AcceptRole)
+        delete_btn = msg.addButton("Remove plan + delete backups",
+                                   QMessageBox.ButtonRole.DestructiveRole)
+        msg.setDefaultButton(cancel_btn)
+        msg.exec()
+        clicked = msg.clickedButton()
+        if clicked is cancel_btn or clicked is None:
+            return
+
+        remove_backups = clicked is delete_btn
+        args = [
+            "--plan", plan.plan_name,
+            "--config", str(self._config_path_for(plan.plan_name)),
+            "--remove-plan",
+        ]
+        if remove_backups:
+            args.append("--remove-backups")
+        title = (f"Remove {plan.plan_name} (+ delete backups)" if remove_backups
+                 else f"Remove {plan.plan_name}")
+        self._spawn_worker(title, args)
+        self._reload_after_remove()
+
+    def _reload_after_remove(self) -> None:
+        """Re-discover plans after a removal. Select the next plan if any."""
+        self._current_plan_name = None
+        self._dirty = False
+        self._discover_plans()
+        if self._plan_list.count():
+            self._plan_list.setCurrentRow(0)
+        else:
+            self._set_actions_enabled(False)
+            # Clear panels so they don't display a stale plan.
+            self._plan_panel._plan = None
+        self._update_status()
+
     # ---------- new plan ----------
 
     def _new_plan(self) -> None:
@@ -316,19 +553,51 @@ class MainWindow(QMainWindow):
             return
         if choice.startswith("home"):
             plan = configlib.defaults_home()
+            if plan.plan_name in self._plans:
+                QMessageBox.warning(self, "Plan exists",
+                                    f"Plan {plan.plan_name!r} already exists.")
+                return
         elif choice.startswith("system"):
             plan = configlib.defaults_system()
-        else:
-            name, ok = QInputDialog.getText(self, "Plan name", "Plan name (letters/digits/-/_):")
-            if not ok or not name.strip():
+            if plan.plan_name in self._plans:
+                QMessageBox.warning(self, "Plan exists",
+                                    f"Plan {plan.plan_name!r} already exists.")
                 return
+        else:
+            # Loop until the user picks a unique, well-formed name or cancels.
+            # The regex matches what schedule.py's cron-marker parser accepts,
+            # so names that pass here are safe to install in cron.
+            import re
+            valid = re.compile(r"^[A-Za-z0-9_-]+$")
+            name = ""
+            while True:
+                name, ok = QInputDialog.getText(
+                    self, "Plan name",
+                    "Plan name (letters/digits/-/_):",
+                    text=name,
+                )
+                if not ok:
+                    return
+                name = name.strip()
+                if not name:
+                    continue
+                if not valid.match(name):
+                    QMessageBox.warning(
+                        self, "Invalid plan name",
+                        f"{name!r} contains characters outside letters, digits, "
+                        f"'-' and '_'. Choose a different name.",
+                    )
+                    continue
+                if name in self._plans:
+                    QMessageBox.warning(
+                        self, "Plan exists",
+                        f"A plan named {name!r} already exists. "
+                        f"Choose a different name.",
+                    )
+                    continue
+                break
             plan = configlib.defaults_home()
-            plan.plan_name = name.strip()
-
-        if plan.plan_name in self._plans:
-            QMessageBox.warning(self, "Plan exists",
-                                f"Plan {plan.plan_name!r} already exists.")
-            return
+            plan.plan_name = name
 
         path = self._config_path_for(plan.plan_name)
         if plan.plan_name == "system" and not os.access(path.parent.parent, os.W_OK):

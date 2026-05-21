@@ -1,0 +1,4 @@
+polkit/com.timetraveller.install-system-crontab.policy usr/share/polkit-1/actions/
+libexec/timetraveller-install-system-cron usr/libexec/
+timetraveller.desktop usr/share/applications/
+timetraveller.png usr/share/icons/hicolor/512x512/apps/

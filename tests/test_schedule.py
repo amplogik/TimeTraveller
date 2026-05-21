@@ -273,6 +273,37 @@ def test_render_monthly_disabled_incr():
     assert len(entries) == 1
 
 
+# ---------- archive ----------
+
+def _archive_plan(name: str = "winboat-archive") -> PlanConfig:
+    return PlanConfig(
+        plan_name=name,
+        sources=["/home/kim/winboat"],
+        schedule=Schedule(mode="archive"),
+        retention=Retention(policy="keep_all"),
+    )
+
+
+def test_render_archive_emits_no_entries():
+    """Archive plans run only when invoked manually — no cron lines."""
+    assert render_entries(_archive_plan(), BIN) == []
+
+
+def test_render_archive_block_is_marker_only():
+    """The managed block still exists (so install/remove machinery works),
+    but it contains zero schedule entries."""
+    block = render_block(_archive_plan(), BIN)
+    assert ">>> TimeTraveller managed: plan=winboat-archive" in block
+    assert "<<< TimeTraveller managed: plan=winboat-archive" in block
+    # No --plan ... --kind lines between the markers.
+    assert "--kind" not in block
+
+
+def test_archive_plan_validates():
+    """schedule.mode=archive + retention.policy=keep_all is a valid config."""
+    _archive_plan().validate()  # must not raise
+
+
 # ---------- backward compatibility ----------
 
 def test_load_old_style_full_day_singular():

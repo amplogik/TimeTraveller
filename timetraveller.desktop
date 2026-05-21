@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=TimeTraveller
+GenericName=Backup Tool
+Comment=Trustworthy local backups with fast partial recovery
+Exec=timetraveller
+Icon=timetraveller
+Terminal=false
+Categories=System;Utility;Archiving;
+Keywords=backup;archive;restore;pax;zstd;timeshift;
+StartupNotify=true
+StartupWMClass=TimeTraveller

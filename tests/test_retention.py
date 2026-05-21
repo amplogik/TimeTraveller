@@ -112,3 +112,45 @@ def test_no_complete_cycle_keeps_everything():
     ])
     plan = apply(m, policy="max_cycles", max_cycles=1, now=NOW)
     assert plan.delete == []
+
+
+# ---------- keep_all (archive plans) ----------
+
+def test_keep_all_never_deletes_anything():
+    """Archive plans use keep_all — every cycle is preserved regardless of
+    count, age, or size."""
+    m = _five_weekly_cycles()
+    plan = apply(m, policy="keep_all", now=NOW)
+    assert plan.delete == []
+    assert {c.cycle_id for c in plan.keep} == {
+        "2026-04-19", "2026-04-26", "2026-05-03", "2026-05-10", "2026-05-17",
+    }
+
+
+def test_keep_all_ignores_max_cycles_arg():
+    """Passing a small max_cycles must not affect keep_all behaviour."""
+    m = _five_weekly_cycles()
+    plan = apply(m, policy="keep_all", max_cycles=1, now=NOW)
+    assert plan.delete == []
+    assert len(plan.keep) == 5
+
+
+def test_keep_all_preserves_incomplete_cycles_too():
+    """A leading failed full (which cycles() represents as an incomplete stub
+    cycle) is still kept under keep_all, alongside any complete cycles."""
+    m = Manifest(plan_name="archive", archives=[
+        _entry("2026-04-12", "full", status="failed"),  # stub incomplete cycle
+        _entry("2026-04-19", "full"),
+        _entry("2026-05-17", "full"),
+    ])
+    plan = apply(m, policy="keep_all", now=NOW)
+    assert plan.delete == []
+    assert {c.cycle_id for c in plan.keep} == {"2026-04-12", "2026-04-19", "2026-05-17"}
+
+
+def test_keep_all_with_empty_manifest():
+    """No cycles → nothing to keep, nothing to delete."""
+    m = Manifest(plan_name="archive", archives=[])
+    plan = apply(m, policy="keep_all", now=NOW)
+    assert plan.delete == []
+    assert plan.keep == []

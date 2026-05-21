@@ -1,0 +1,31 @@
+#!/usr/bin/make -f
+
+# Ubuntu 26.04's setuptools 78.1.1 has the Debian install_layout patch only
+# partially applied, which breaks both pybuild plugins (pyproject + distutils).
+# Bypass setuptools entirely: this is a pure-Python project, so we just copy
+# the module tree into dist-packages and hand-write the two entry-point shims.
+
+DESTDIR := debian/timetraveller
+PYDIR   := $(DESTDIR)/usr/lib/python3/dist-packages
+BINDIR  := $(DESTDIR)/usr/bin
+
+%:
+	dh $@ --with python3 --buildsystem=none
+
+override_dh_auto_build:
+
+override_dh_auto_install:
+	# Python module tree.
+	mkdir -p $(PYDIR)
+	cp -r timetraveller $(PYDIR)/
+	find $(PYDIR) -name __pycache__ -type d -exec rm -rf {} +
+	# Entry-point shims for the GUI and CLI.
+	mkdir -p $(BINDIR)
+	printf '#!/usr/bin/python3\nimport sys\nfrom timetraveller.worker import main\nsys.exit(main())\n' > $(BINDIR)/timetraveller-backup
+	printf '#!/usr/bin/python3\nimport sys\nfrom timetraveller.gui.app import main\nsys.exit(main())\n' > $(BINDIR)/timetraveller
+	chmod 755 $(BINDIR)/timetraveller $(BINDIR)/timetraveller-backup
+
+override_dh_auto_test:
+
+override_dh_auto_clean:
+	rm -rf build dist *.egg-info .pybuild

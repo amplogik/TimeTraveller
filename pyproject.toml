@@ -4,13 +4,37 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "timetraveller"
-version = "0.1.0"
-description = "Local pax+rsync backup tool for Linux with PyQt GUI"
+version = "1.0.0"
+description = "Local Linux backup tool with seekable pax+zstd archives and a PyQt GUI"
+readme = "README.md"
+license = { text = "GPL-3.0-or-later" }
 requires-python = ">=3.11"
+authors = [
+    { name = "Kim McCann", email = "amplogik@gmail.com" },
+]
+maintainers = [
+    { name = "Kim McCann", email = "amplogik@gmail.com" },
+]
+keywords = ["backup", "pax", "zstd", "archive", "linux", "restore"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Archiving :: Backup",
+]
 dependencies = [
     "PyYAML>=6.0",
     "zstandard>=0.20",
 ]
+
+[project.urls]
+Homepage = "https://github.com/amplogik/TimeTraveller"
+Issues = "https://github.com/amplogik/TimeTraveller/issues"
 
 [project.optional-dependencies]
 gui = ["PyQt6>=6.5"]
@@ -18,6 +42,9 @@ dev = ["pytest>=7.0"]
 
 [project.scripts]
 timetraveller-backup = "timetraveller.worker:main"
+
+[project.gui-scripts]
+timetraveller = "timetraveller.gui.app:main"
 
 [tool.setuptools.packages.find]
 include = ["timetraveller*"]

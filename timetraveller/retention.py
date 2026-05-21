@@ -31,6 +31,10 @@ def apply(manifest: Manifest, *, policy: str, max_cycles: int = 4,
     now = now or datetime.now(timezone.utc)
     all_cycles = cycles(manifest)
 
+    if policy == "keep_all":
+        reasons = {c.cycle_id: "keep_all policy; archive plan" for c in all_cycles}
+        return RetentionPlan(delete=[], keep=all_cycles, reasons=reasons)
+
     complete = [c for c in all_cycles if c.is_complete]
     incomplete = [c for c in all_cycles if not c.is_complete]
 

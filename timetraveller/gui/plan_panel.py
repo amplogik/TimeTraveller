@@ -219,6 +219,7 @@ class PlanPanel(QWidget):
     """Edits one PlanConfig. Emits changed() when the user touches anything."""
 
     changed = pyqtSignal()
+    switch_type_requested = pyqtSignal()  # user clicked "Change…" next to plan type
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -230,6 +231,22 @@ class PlanPanel(QWidget):
         # Plan name (read-only; you create a new plan to change it).
         self._name = QLabel("(no plan loaded)")
         layout.addRow("Plan name:", self._name)
+
+        # Plan type — Active vs Archive. Read-only label + Change… button.
+        # The actual switch goes through a confirm dialog (see MainWindow wiring).
+        type_box = QWidget()
+        th = QHBoxLayout(type_box)
+        th.setContentsMargins(0, 0, 0, 0)
+        self._type_label = QLabel("(unknown)")
+        self._type_change = QPushButton("Change…")
+        self._type_change.setToolTip(
+            "Switch between Active (scheduled, with retention) and Archive "
+            "(manual-only, keeps everything forever)."
+        )
+        self._type_change.clicked.connect(self.switch_type_requested.emit)
+        th.addWidget(self._type_label, 1)
+        th.addWidget(self._type_change)
+        layout.addRow("Plan type:", type_box)
 
         # Sources.
         self._sources = _StringListEditor(
@@ -270,11 +287,15 @@ class PlanPanel(QWidget):
         self._hostname_path = QCheckBox("Include hostname in destination path")
         layout.addRow("", self._hostname_path)
 
-        # Retention.
-        ret_box = QGroupBox("Retention")
-        rl = QFormLayout(ret_box)
+        # Retention. Hidden when the loaded plan is an Archive plan — those
+        # use the keep_all policy which has no knobs.
+        self._ret_box = QGroupBox("Retention")
+        rl = QFormLayout(self._ret_box)
+        # Only the rotating-retention policies appear in the combobox; keep_all
+        # is a property of Archive plans and is set via the Plan type switch,
+        # not picked here.
         self._policy = QComboBox()
-        self._policy.addItems(RETENTION_POLICIES)
+        self._policy.addItems([p for p in RETENTION_POLICIES if p != "keep_all"])
         self._max_cycles = QSpinBox()
         self._max_cycles.setRange(1, 999)
         self._max_age = QSpinBox()
@@ -288,7 +309,17 @@ class PlanPanel(QWidget):
         rl.addRow("Max cycles:", self._max_cycles)
         rl.addRow("Max age:", self._max_age)
         rl.addRow("Max size:", self._max_size)
-        layout.addRow(ret_box)
+        layout.addRow(self._ret_box)
+
+        # Shown in place of the Retention box for archive plans.
+        self._archive_note = QLabel(
+            "<i>Archive plans keep all cycles forever. Prune manually with "
+            "<code>timetraveller-backup --plan &lt;name&gt; --prune</code> "
+            "if needed.</i>"
+        )
+        self._archive_note.setWordWrap(True)
+        self._archive_note.setVisible(False)
+        layout.addRow(self._archive_note)
 
         # Mount options.
         mnt_box = QGroupBox("Mount options")
@@ -333,7 +364,15 @@ class PlanPanel(QWidget):
         self._excludes.set_items(plan.excludes)
         self._dest.setText(plan.destination)
         self._hostname_path.setChecked(plan.include_hostname_in_path)
-        self._policy.setCurrentText(plan.retention.policy)
+        is_archive = plan.schedule.mode == "archive"
+        self._type_label.setText("<b>Archive</b> (manual only, keeps all cycles)"
+                                 if is_archive
+                                 else "<b>Active</b> (scheduled, with retention)")
+        self._ret_box.setVisible(not is_archive)
+        self._archive_note.setVisible(is_archive)
+        if not is_archive:
+            # Only meaningful for Active plans; combobox doesn't include keep_all.
+            self._policy.setCurrentText(plan.retention.policy)
         self._max_cycles.setValue(plan.retention.max_cycles)
         self._max_age.setValue(plan.retention.max_age_days or 30)
         self._max_size.setValue(plan.retention.max_size_gb or 100.0)
@@ -345,12 +384,17 @@ class PlanPanel(QWidget):
     def to_plan(self) -> PlanConfig:
         """Return a PlanConfig reflecting the panel's current state."""
         assert self._plan is not None
-        retention = Retention(
-            policy=self._policy.currentText(),
-            max_cycles=self._max_cycles.value(),
-            max_age_days=self._max_age.value() if self._policy.currentText() == "max_age_days" else None,
-            max_size_gb=self._max_size.value() if self._policy.currentText() == "max_size_gb" else None,
-        )
+        # Archive plans pin retention to keep_all; the editor's combobox /
+        # spinboxes are hidden and irrelevant.
+        if self._plan.schedule.mode == "archive":
+            retention = Retention(policy="keep_all")
+        else:
+            retention = Retention(
+                policy=self._policy.currentText(),
+                max_cycles=self._max_cycles.value(),
+                max_age_days=self._max_age.value() if self._policy.currentText() == "max_age_days" else None,
+                max_size_gb=self._max_size.value() if self._policy.currentText() == "max_size_gb" else None,
+            )
         return replace(
             self._plan,
             sources=self._sources.items(),

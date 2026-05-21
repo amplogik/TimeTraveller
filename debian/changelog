@@ -1,0 +1,14 @@
+timetraveller (1.0.0) unstable; urgency=medium
+
+  * Initial 1.0 release.
+    - Seekable pax+zstd archives with per-file random-access extraction
+    - Plan types: Active (scheduled, with retention) and Archive (manual, keep_all)
+    - GUI: Plan / Schedule / Archives tabs with switch and remove operations
+    - CLI worker with full coverage: --kind, --prune, --extract, --verify,
+      --reindex, --list-archives, --list-files, --show-mounts, --show-schedule,
+      --install-schedule, --suspend-schedule, --resume-schedule, --remove-plan,
+      --switch-to-archive, --switch-to-active
+    - Polkit-mediated installation of the system plan's cron entries
+    - Built-in Help / About dialog with task-oriented how-tos and search
+
+ -- Kim McCann <amplogik@gmail.com>  Wed, 20 May 2026 20:40:00 -0700

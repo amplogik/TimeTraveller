@@ -74,6 +74,19 @@ def build_parser() -> argparse.ArgumentParser:
                               "falls back to whole-archive scan otherwise.")
     actions.add_argument("--prune", action="store_true",
                          help="Apply retention without taking a new backup.")
+    actions.add_argument("--remove-plan", action="store_true",
+                         help="Uninstall the plan's schedule, delete its config file, "
+                              "and clear its local mirror state. By default, archive "
+                              "files on the backup mount are kept; pass --remove-backups "
+                              "to delete them too.")
+    actions.add_argument("--switch-to-archive", action="store_true",
+                         help="Convert this plan to an Archive plan: prune all "
+                              "cycles except the newest, then set schedule.mode=archive "
+                              "and retention.policy=keep_all. Destructive; cannot be undone.")
+    actions.add_argument("--switch-to-active", action="store_true",
+                         help="Convert this plan from Archive to Active: set "
+                              "schedule.mode=weekly with default cadence and "
+                              "retention.policy=max_cycles. Existing cycles are kept.")
     actions.add_argument("--show-schedule", action="store_true",
                          help="Render the cron block for this plan to stdout (no install).")
     actions.add_argument("--install-schedule", action="store_true",
@@ -96,6 +109,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="With --list-archives: also enumerate archive files "
                         "on the mount that are absent from the manifest. "
                         "Touches the backup mount.")
+    p.add_argument("--remove-backups", action="store_true",
+                   help="With --remove-plan: also unlink every archive file "
+                        "and sidecar under the plan's archive directory. "
+                        "Destructive; cannot be undone.")
     p.add_argument("--binary-path", type=str, default=None,
                    help="Path to timetraveller-backup to use in cron entries. "
                         "Defaults to /usr/local/bin/timetraveller-backup, or the "
@@ -595,20 +612,201 @@ def action_prune(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
         max_size_gb=plan.retention.max_size_gb,
     )
     print(retentionlib.format_plan(plan_obj))
-    if not plan_obj.delete:
-        return 0
-    for cycle in plan_obj.delete:
+    _delete_cycles(archive_dir, plan.plan_name, plan_obj.delete, m, log=lambda msg: _log(args, msg))
+    return 0
+
+
+def _delete_cycles(archive_dir: Path, plan_name: str,
+                   cycles_to_delete: list, manifest: manifestlib.Manifest,
+                   log=None) -> None:
+    """Delete the given cycles' archive files + sidecars and update the manifest.
+
+    Shared by action_prune and prune_to_newest_cycle. Saves the manifest only
+    if at least one cycle was deleted.
+    """
+    if not cycles_to_delete:
+        return
+    log = log or (lambda _msg: None)
+    for cycle in cycles_to_delete:
         for a in cycle.archives:
             apath = archive_dir / a.filename
             spath = indexlib.sidecar_path(apath)
             for p in (apath, spath):
                 if p.exists():
-                    _log(args, f"prune: rm {p}")
+                    log(f"prune: rm {p}")
                     p.unlink()
-            indexlib.delete_sidecar_mirror(plan.plan_name, a.filename)
-            m.remove(a.filename)
-    _save_manifest(m, archive_dir, plan.plan_name)
+            indexlib.delete_sidecar_mirror(plan_name, a.filename)
+            manifest.remove(a.filename)
+    _save_manifest(manifest, archive_dir, plan_name)
+
+
+def _config_path_for_args(args: argparse.Namespace) -> Path:
+    """Resolve the YAML path we should write back to. Mirrors _load_plan."""
+    if args.config:
+        return Path(args.config)
+    return configlib.resolve_config_path(args.plan)
+
+
+def action_switch_to_archive(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
+    """Convert an Active plan to an Archive plan.
+
+    Steps:
+      1. Prune all cycles except the newest complete one.
+      2. Set schedule.mode=archive and retention.policy=keep_all.
+      3. Save the YAML back to its source path.
+
+    Destructive — older cycles are physically deleted from disk.
+    """
+    if plan.schedule.mode == "archive":
+        print(f"plan {plan.plan_name!r} is already an Archive plan; nothing to do.")
+        return 0
+
+    path = _config_path_for_args(args)
+    print(f"switching plan {plan.plan_name!r} to Archive (config: {path})")
+
+    deleted = prune_to_newest_cycle(plan, log=lambda msg: _log(args, msg))
+    if deleted:
+        n_archives = sum(len(c.archives) for c in deleted)
+        print(f"pruned {len(deleted)} older cycle(s) ({n_archives} archive(s)).")
+    else:
+        print("no older cycles to prune.")
+
+    plan.schedule = configlib.Schedule(mode="archive")
+    plan.retention = configlib.Retention(policy="keep_all")
+    plan.validate()
+    configlib.save(plan, path)
+    print(f"saved {path}: schedule.mode=archive, retention.policy=keep_all")
     return 0
+
+
+def action_switch_to_active(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
+    """Convert an Archive plan to an Active plan.
+
+    Sets schedule.mode=weekly with the standard defaults and retention.policy=
+    max_cycles (max_cycles=4). Existing cycles on disk are preserved; retention
+    starts applying from the next prune.
+    """
+    if plan.schedule.mode != "archive":
+        print(f"plan {plan.plan_name!r} is not an Archive plan; nothing to do.")
+        return 0
+
+    path = _config_path_for_args(args)
+    print(f"switching plan {plan.plan_name!r} to Active (config: {path})")
+
+    plan.schedule = configlib.Schedule()  # defaults: weekly, Sundays 02:00, except_full incrs
+    plan.retention = configlib.Retention()  # defaults: max_cycles=4
+    plan.validate()
+    configlib.save(plan, path)
+    print(f"saved {path}: schedule.mode=weekly, retention.policy=max_cycles")
+    print("existing cycles preserved. Run --prune or wait for the next scheduled "
+          "prune to apply retention.")
+    return 0
+
+
+def action_remove_plan(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
+    """Remove a plan: uninstall its schedule, clear local state, delete its YAML.
+
+    With --remove-backups, also unlink every archive file + sidecar under the
+    plan's archive directory. Without that flag, the on-mount archives are
+    preserved (the user can browse to them manually if they reconsider).
+
+    Best-effort throughout: a failure in one step is reported but doesn't stop
+    the next step. The function returns 0 if every step succeeded, 1 otherwise.
+    """
+    import shutil
+    plan_name = plan.plan_name
+    path = _config_path_for_args(args)
+    print(f"removing plan {plan_name!r} (config: {path})")
+    if args.remove_backups:
+        print("WARNING: --remove-backups is set; archive files will be deleted.")
+
+    errors: list[str] = []
+
+    # 1. Uninstall the schedule. action_uninstall_schedule is a no-op when no
+    #    managed block exists, so this is safe even if the user never installed.
+    try:
+        rc = action_uninstall_schedule(args, plan)
+        if rc != 0:
+            errors.append(f"schedule uninstall returned exit {rc}")
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"schedule uninstall: {e}")
+
+    # 2. Optionally delete the on-mount archive files. Touches the backup mount.
+    if args.remove_backups:
+        archive_dir = plan.archive_dir()
+        if archive_dir.exists():
+            try:
+                n_files = 0
+                for child in sorted(archive_dir.iterdir()):
+                    if child.is_file():
+                        child.unlink()
+                        n_files += 1
+                # Remove the now-empty plan dir. We do NOT bubble up to the host
+                # dir — other plans may still live under it.
+                try:
+                    archive_dir.rmdir()
+                except OSError as e:
+                    print(f"note: could not remove {archive_dir}: {e}", file=sys.stderr)
+                print(f"deleted {n_files} archive file(s) from {archive_dir}")
+            except OSError as e:
+                errors.append(f"archive deletion: {e}")
+        else:
+            print(f"no archive directory at {archive_dir}; nothing to delete.")
+
+    # 3. Clear the local mirror state (manifest mirror, sidecar mirror, log).
+    mirror_dir = manifestlib.mirror_manifest_path(plan_name).parent
+    if mirror_dir.exists():
+        try:
+            shutil.rmtree(mirror_dir)
+            print(f"cleared local mirror state at {mirror_dir}")
+        except OSError as e:
+            errors.append(f"mirror cleanup: {e}")
+
+    log_path = _default_log_path(plan_name)
+    if log_path.exists():
+        try:
+            log_path.unlink()
+            print(f"removed log file {log_path}")
+        except OSError as e:
+            errors.append(f"log removal: {e}")
+
+    # 4. Delete the YAML config last — once it's gone, the plan is "removed"
+    #    from the GUI's perspective. Earlier steps reference plan fields, so
+    #    keeping the YAML around through them simplifies recovery if something
+    #    fails partway.
+    if path.exists():
+        try:
+            path.unlink()
+            print(f"removed config file {path}")
+        except OSError as e:
+            errors.append(f"config removal: {e}")
+    else:
+        print(f"config file {path} already gone.")
+
+    if errors:
+        print(f"\nremove-plan finished with {len(errors)} issue(s):", file=sys.stderr)
+        for e in errors:
+            print(f"  - {e}", file=sys.stderr)
+        return 1
+    print(f"\nplan {plan_name!r} removed.")
+    return 0
+
+
+def prune_to_newest_cycle(plan: configlib.PlanConfig, log=None) -> list:
+    """Prune every cycle except the newest complete one. Used by Active→Archive.
+
+    Returns the list of deleted Cycles (each carries its archives list, so the
+    caller can summarise what was removed). Incomplete cycles follow the same
+    retention rule as normal pruning: they are kept (see retention.py docstring).
+    """
+    archive_dir = plan.archive_dir()
+    mpath = manifestlib.manifest_path(archive_dir)
+    m = manifestlib.load(mpath)
+    if not m.plan_name:
+        m.plan_name = plan.plan_name
+    rplan = retentionlib.apply(m, policy="max_cycles", max_cycles=1)
+    _delete_cycles(archive_dir, plan.plan_name, rplan.delete, m, log=log)
+    return rplan.delete
 
 
 DEFAULT_INSTALLED_BINARY = "/usr/local/bin/timetraveller-backup"
@@ -1078,6 +1276,12 @@ def main(argv: list[str] | None = None) -> int:
         return action_extract(args, plan)
     if args.prune:
         return action_prune(args, plan)
+    if args.remove_plan:
+        return action_remove_plan(args, plan)
+    if args.switch_to_archive:
+        return action_switch_to_archive(args, plan)
+    if args.switch_to_active:
+        return action_switch_to_active(args, plan)
     if args.show_schedule:
         return action_show_schedule(args, plan)
     if args.install_schedule:

@@ -220,8 +220,10 @@ class SchedulePanel(QWidget):
 
         layout = QVBoxLayout(self)
 
-        # Top: mode radio.
-        mode_row = QHBoxLayout()
+        # Top: mode radio. Hidden when an archive plan is loaded.
+        self._mode_row_w = QWidget()
+        mode_row = QHBoxLayout(self._mode_row_w)
+        mode_row.setContentsMargins(0, 0, 0, 0)
         mode_row.addWidget(QLabel("<b>Schedule mode:</b>"))
         self.mode_weekly = QRadioButton("Weekly")
         self.mode_monthly = QRadioButton("Monthly")
@@ -230,7 +232,21 @@ class SchedulePanel(QWidget):
             self._mode_group.addButton(btn)
             mode_row.addWidget(btn)
         mode_row.addStretch(1)
-        layout.addLayout(mode_row)
+        layout.addWidget(self._mode_row_w)
+
+        # Archive-plan notice — shown in place of the schedule editor when
+        # plan.schedule.mode == "archive".
+        self._archive_notice = QLabel(
+            "<b>Archive plan</b> — no schedule. Backups run only when invoked "
+            "manually (CLI <code>--kind full</code> / <code>--kind incr</code>, "
+            "or the Run button on the Archives tab).<br>"
+            "<i>To put this plan back on a schedule, switch its type to "
+            "Active on the Plan tab.</i>"
+        )
+        self._archive_notice.setWordWrap(True)
+        self._archive_notice.setVisible(False)
+        self._archive_notice.setStyleSheet("padding: 12px;")
+        layout.addWidget(self._archive_notice)
 
         # Stacked weekly/monthly pages.
         self._stack = QStackedWidget()
@@ -241,8 +257,8 @@ class SchedulePanel(QWidget):
         layout.addWidget(self._stack)
 
         # Preview.
-        preview_box = QGroupBox("Cron entries that will be installed")
-        pl = QVBoxLayout(preview_box)
+        self._preview_box = QGroupBox("Cron entries that will be installed")
+        pl = QVBoxLayout(self._preview_box)
         self._preview = QPlainTextEdit()
         self._preview.setReadOnly(True)
         mono = QFont("Monospace")
@@ -250,7 +266,7 @@ class SchedulePanel(QWidget):
         self._preview.setFont(mono)
         self._preview.setMaximumHeight(150)
         pl.addWidget(self._preview)
-        layout.addWidget(preview_box)
+        layout.addWidget(self._preview_box)
 
         # Status indicator (computed from user crontab for home plan).
         status_row = QHBoxLayout()
@@ -288,6 +304,20 @@ class SchedulePanel(QWidget):
     def load_plan(self, plan: PlanConfig) -> None:
         self._plan = plan
         sch = plan.schedule
+
+        # Archive plans replace the entire schedule editor with a notice and
+        # disable the install/suspend buttons (cron is not used).
+        is_archive = sch.mode == "archive"
+        self._mode_row_w.setVisible(not is_archive)
+        self._stack.setVisible(not is_archive)
+        self._preview_box.setVisible(not is_archive)
+        self._archive_notice.setVisible(is_archive)
+        for b in (self._install_btn, self._uninstall_btn,
+                  self._suspend_btn, self._resume_btn):
+            b.setEnabled(not is_archive)
+        if is_archive:
+            self._status_label.setText("<i>Archive plan — no schedule installed</i>")
+            return
 
         # Mode.
         if sch.mode == "monthly":
@@ -348,6 +378,10 @@ class SchedulePanel(QWidget):
 
     def to_plan(self) -> PlanConfig:
         assert self._plan is not None
+        # Archive plans pin the schedule; the editor controls are hidden and
+        # have no meaningful values to read back.
+        if self._plan.schedule.mode == "archive":
+            return self._plan
         if self.mode_weekly.isChecked():
             full = FullSchedule(
                 days=self._collect_weekdays(self._weekly.full_days),

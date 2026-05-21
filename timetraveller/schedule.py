@@ -85,10 +85,15 @@ def render_entries(plan: PlanConfig, binary_path: str) -> list[CronEntry]:
     """Render a plan's schedule into cron entries (without markers).
 
     Output entries depend on the schedule mode and the incr sub-mode:
+      - archive: no entries (manual --kind full/incr only)
       - weekly + (weekdays|except_full|disabled)
       - monthly + (weekdays|every_n_days|disabled)
     Disabled incr emits only the full entry.
     """
+    sch = plan.schedule
+    if sch.mode == "archive":
+        return []
+
     fh, fm = _parse_time(plan.schedule.full.time)
     ih, im = _parse_time(plan.schedule.incr.time)
 
@@ -97,7 +102,6 @@ def render_entries(plan: PlanConfig, binary_path: str) -> list[CronEntry]:
 
     entries: list[CronEntry] = []
 
-    sch = plan.schedule
     if sch.mode == "weekly":
         entries.append(CronEntry(
             minute=str(fm), hour=str(fh),
