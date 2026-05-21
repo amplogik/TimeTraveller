@@ -809,8 +809,26 @@ def prune_to_newest_cycle(plan: configlib.PlanConfig, log=None) -> list:
     return rplan.delete
 
 
-DEFAULT_INSTALLED_BINARY = "/usr/local/bin/timetraveller-backup"
+# Canonical paths where a real timetraveller-backup shim lives after install.
+# Both are accepted by the pkexec helper's allowlist; whichever exists is the
+# right thing to embed in cron entries.
+#   /usr/bin/timetraveller-backup        installed by the .deb package
+#   /usr/local/bin/timetraveller-backup  installed by install.sh (dev)
+_INSTALLED_BINARY_CANDIDATES = (
+    "/usr/bin/timetraveller-backup",
+    "/usr/local/bin/timetraveller-backup",
+)
 PKEXEC_HELPER_PATH = "/usr/libexec/timetraveller-install-system-cron"
+
+
+def _default_installed_binary() -> str:
+    """Return whichever canonical install location actually exists on disk."""
+    for path in _INSTALLED_BINARY_CANDIDATES:
+        if os.path.exists(path):
+            return path
+    # Fall back to the deb path even if missing — the helper will reject and
+    # the user gets a clear error rather than a vague KeyError.
+    return _INSTALLED_BINARY_CANDIDATES[0]
 
 
 def _binary_path_for_cron(args: argparse.Namespace, plan: configlib.PlanConfig) -> str:
@@ -821,11 +839,11 @@ def _binary_path_for_cron(args: argparse.Namespace, plan: configlib.PlanConfig) 
         if plan.plan_name == "system":
             raise SystemExit(
                 "ERROR: --dev-binary-path is only allowed for the home plan. "
-                "The pkexec helper rejects non-/usr/local paths for security. "
-                "Install via install.sh for system schedules."
+                "The pkexec helper rejects non-canonical paths for security. "
+                "Install via install.sh or the .deb for system schedules."
             )
         return os.path.realpath(sys.argv[0])
-    return DEFAULT_INSTALLED_BINARY
+    return _default_installed_binary()
 
 
 def _read_user_crontab() -> str:

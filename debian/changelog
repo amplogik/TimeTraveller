@@ -1,3 +1,14 @@
+timetraveller (1.0.1) unstable; urgency=medium
+
+  * Fix system-plan --install-schedule under the .deb install.
+    The pkexec helper only accepted /usr/local/bin/timetraveller-backup
+    (the install.sh path); it now also accepts /usr/bin/timetraveller-backup
+    (the .deb path). The worker auto-detects which canonical path exists,
+    and the GUI no longer passes a bogus --binary-path computed from the
+    site-packages layout for system-plan installs.
+
+ -- Kim McCann <amplogik@gmail.com>  Thu, 21 May 2026 09:00:00 -0700
+
 timetraveller (1.0.0) unstable; urgency=medium
 
   * Initial 1.0 release.

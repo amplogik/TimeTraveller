@@ -26,10 +26,15 @@ import re
 import subprocess
 import sys
 
-# The only binary path we accept in cron entries we install. Hardcoded so
+# The only binary paths we accept in cron entries we install. Hardcoded so
 # this helper can't be tricked into installing a cron entry that runs an
 # arbitrary script as root.
-ALLOWED_BINARY = "/usr/local/bin/timetraveller-backup"
+#  - /usr/bin/timetraveller-backup       installed by the .deb package
+#  - /usr/local/bin/timetraveller-backup installed by install.sh (dev)
+ALLOWED_BINARIES = frozenset({
+    "/usr/bin/timetraveller-backup",
+    "/usr/local/bin/timetraveller-backup",
+})
 
 # Match each cron entry tightly: the standard 5 time-field charset, then our
 # allowed binary path, then a fixed --plan/--kind pair. No shell, no pipes,
@@ -93,8 +98,9 @@ def validate_block(block_text: str, plan_name: str) -> None:
         m = ENTRY_RE.match(line)
         if not m:
             fail(f"refusing: line {i} does not match the strict pattern: {line!r}")
-        if m.group("path") != ALLOWED_BINARY:
-            fail(f"refusing: line {i} uses binary path {m.group('path')!r} (only {ALLOWED_BINARY!r} allowed)")
+        if m.group("path") not in ALLOWED_BINARIES:
+            fail(f"refusing: line {i} uses binary path {m.group('path')!r} "
+                 f"(allowed: {sorted(ALLOWED_BINARIES)})")
         if m.group("plan") != plan_name:
             fail(f"refusing: line {i} plan name {m.group('plan')!r} does not match block plan {plan_name!r}")
         if m.group("kind") not in ALLOWED_KINDS:
@@ -141,7 +147,7 @@ def _stripped_entry_safe(line: str, plan_name: str) -> str | None:
     em = ENTRY_RE.match(candidate)
     if not em:
         return None
-    if em.group("path") != ALLOWED_BINARY:
+    if em.group("path") not in ALLOWED_BINARIES:
         return None
     if em.group("plan") != plan_name:
         return None

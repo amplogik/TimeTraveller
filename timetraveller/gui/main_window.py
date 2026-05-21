@@ -312,13 +312,10 @@ class MainWindow(QMainWindow):
             "--config", str(self._config_path_for(self._current_plan_name)),
         ]
         if install:
-            # Pass the path to the dev shim explicitly so the cron entries
-            # use a path that exists and passes the helper's allowlist.
-            # (`--dev-binary-path` would give us worker.py here since we
-            # invoke the worker via `python -m`.)
-            repo_root = Path(__file__).resolve().parents[2]
-            dev_shim = repo_root / "bin" / "timetraveller-backup"
-            args += ["--install-schedule", "--binary-path", str(dev_shim)]
+            args += ["--install-schedule"]
+            override = self._cron_binary_override()
+            if override is not None:
+                args += ["--binary-path", override]
             title = "Install schedule"
         else:
             args += ["--uninstall-schedule"]
@@ -338,6 +335,26 @@ class MainWindow(QMainWindow):
         self._spawn_worker(title, args)
         # Refresh status afterwards.
         self._schedule_panel.refresh_status()
+
+    def _cron_binary_override(self) -> str | None:
+        """Return a --binary-path to pass to --install-schedule, or None.
+
+        For SYSTEM plans we always defer to the worker's auto-detection — the
+        pkexec helper only accepts canonical installed paths.
+
+        For HOME plans we ALSO prefer the worker default when an installed
+        shim exists. Only when running from a bare checkout (no install.sh,
+        no .deb) do we fall back to the repo's bin/ shim so the user crontab
+        entry points at a real, executable script.
+        """
+        if self._current_plan_name == "system":
+            return None
+        for path in ("/usr/bin/timetraveller-backup",
+                     "/usr/local/bin/timetraveller-backup"):
+            if Path(path).exists():
+                return None
+        repo_root = Path(__file__).resolve().parents[2]
+        return str(repo_root / "bin" / "timetraveller-backup")
 
     def _confirm_save_before_install(self) -> bool:
         r = QMessageBox.question(
