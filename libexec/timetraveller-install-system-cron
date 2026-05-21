@@ -60,7 +60,9 @@ END_MARKER_RE = re.compile(
     r"^# <<< TimeTraveller managed: plan=(?P<plan>[A-Za-z0-9_-]+).*$"
 )
 
-ALLOWED_PLANS = {"system"}  # this helper only touches root's crontab for system plans
+# Plan names whose managed block this helper is allowed to install in root's
+# crontab. Kept in sync with timetraveller.config.SYSTEM_PLAN_NAMES.
+ALLOWED_PLANS = frozenset({"system", "homes"})
 ALLOWED_KINDS = {"full", "incr", "auto"}
 
 

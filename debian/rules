@@ -24,6 +24,13 @@ override_dh_auto_install:
 	printf '#!/usr/bin/python3\nimport sys\nfrom timetraveller.worker import main\nsys.exit(main())\n' > $(BINDIR)/timetraveller-backup
 	printf '#!/usr/bin/python3\nimport sys\nfrom timetraveller.gui.app import main\nsys.exit(main())\n' > $(BINDIR)/timetraveller
 	chmod 755 $(BINDIR)/timetraveller $(BINDIR)/timetraveller-backup
+	# Seed /etc/timetraveller/{system,homes}.yaml from the factory defaults so
+	# the GUI shows them on first launch. debhelper auto-detects /etc files as
+	# conffiles, so dpkg will preserve user edits on upgrade.
+	mkdir -p $(DESTDIR)/etc/timetraveller
+	PYTHONPATH=$(PYDIR) python3 -c "import yaml; from dataclasses import asdict; from timetraveller.config import defaults_system; print(yaml.safe_dump(asdict(defaults_system()), sort_keys=False, default_flow_style=False), end='')" > $(DESTDIR)/etc/timetraveller/system.yaml
+	PYTHONPATH=$(PYDIR) python3 -c "import yaml; from dataclasses import asdict; from timetraveller.config import defaults_homes; print(yaml.safe_dump(asdict(defaults_homes()), sort_keys=False, default_flow_style=False), end='')" > $(DESTDIR)/etc/timetraveller/homes.yaml
+	chmod 644 $(DESTDIR)/etc/timetraveller/system.yaml $(DESTDIR)/etc/timetraveller/homes.yaml
 
 override_dh_auto_test:
 

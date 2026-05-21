@@ -1,3 +1,31 @@
+timetraveller (1.0.2) unstable; urgency=medium
+
+  * System-class plans are now plural. A new "homes" default plan backs up
+    every user's /home tree as root via the same pkexec routing path used by
+    the "system" plan. The worker, pkexec helper allowlists, and GUI config
+    discovery all switched from a literal plan_name == "system" check to a
+    SYSTEM_PLAN_NAMES set ({"system", "homes"}). The "home" default now
+    resolves to the invoking user's actual /home/$USER instead of the
+    misleading /home tree.
+  * GUI can now save system-class plans without manual root edits. A new
+    libexec helper (timetraveller-write-system-config) + polkit policy
+    accepts the plan YAML on stdin, validates shape and plan-name, and
+    writes atomically to /etc/timetraveller/<plan>.yaml. The previous
+    "edit it as root" punt is replaced by a single pkexec auth prompt.
+  * Plan list in the GUI now flags system-class plans (those routed through
+    pkexec) with a warning-orange foreground and a "requires admin auth"
+    tooltip to distinguish them from user-crontab plans.
+  * .deb now seeds /etc/timetraveller/system.yaml and /etc/timetraveller/
+    homes.yaml as conffiles, generated at build time from the factory
+    defaults. First-launch users see the two system-class plans pre-listed.
+  * Schedule panel layout cleanup: the "Full backup" section header now sits
+    above the Schedule mode (Weekly/Monthly) radio so it's visually clear
+    that the mode picks the Full backup cadence. Both "Full backup" and
+    "Incremental backup" headers render bold + ~13pt with vertical breathing
+    room so they're easy to spot as section dividers, not just labels.
+
+ -- Kim McCann <amplogik@gmail.com>  Thu, 21 May 2026 10:00:00 -0700
+
 timetraveller (1.0.1) unstable; urgency=medium
 
   * Fix system-plan --install-schedule under the .deb install.

@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""Privileged helper to write TimeTraveller's system-class plan YAML.
+
+Invoked via pkexec by the unprivileged GUI/CLI. We run as root here, so this
+script is security-critical:
+
+ - The YAML to install is read from stdin and validated against a strict
+   shape check. We accept only well-formed YAML mappings whose ``plan_name``
+   matches a fixed allowlist and the plan name passed on the command line.
+ - We never accept a destination path from the caller — the file path is
+   computed from the plan name against a fixed prefix (``/etc/timetraveller/``).
+ - We refuse oversized input (DoS guard) before parsing.
+ - Writes are atomic: we write to a sibling tempfile in the same directory
+   and ``os.replace`` it onto the target so an interrupted write never leaves
+   a half-written config behind.
+ - On any validation failure the helper exits non-zero before touching disk.
+
+Usage (called by pkexec):
+    timetraveller-write-system-config <plan>      # YAML body via stdin
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+
+# stdlib + PyYAML only. We intentionally do NOT import the project's modules:
+# this helper must remain auditable as a single file.
+import yaml
+
+# Plan names whose YAML this helper is allowed to write. Kept in sync with
+# timetraveller.config.SYSTEM_PLAN_NAMES.
+ALLOWED_PLANS = frozenset({"system", "homes"})
+
+# Fixed destination prefix. The full path is ETC_DIR / f"{plan}.yaml" — never
+# anything caller-supplied.
+ETC_DIR = "/etc/timetraveller"
+
+# Hard cap on accepted YAML size in bytes. Plan configs are small; this is
+# generous and exists to bound the cost of parsing.
+MAX_BYTES = 64 * 1024
+
+# Top-level keys we expect in a plan config. Unknown keys are allowed (forward
+# compatibility), but the keys we *do* care about must have the right type.
+_EXPECTED_TYPES: dict[str, type | tuple[type, ...]] = {
+    "plan_name": str,
+    "sources": list,
+    "excludes": list,
+    "destination": str,
+    "schedule": dict,
+    "retention": dict,
+    "include_hostname_in_path": bool,
+    "include_removable": bool,
+    "include_nfs": bool,
+    "include_cifs": bool,
+    "include_mounts": list,
+    "exclude_mounts": list,
+    "compression": str,
+    "framed": bool,
+    "extra_pax_flags": list,
+}
+
+
+def fail(msg: str, code: int = 2) -> None:
+    print(f"timetraveller-write-system-config: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def validate_plan_name(name: str) -> None:
+    if name not in ALLOWED_PLANS:
+        fail(f"refusing: plan name {name!r} not in allowed set {sorted(ALLOWED_PLANS)}")
+
+
+def read_stdin_bounded() -> bytes:
+    """Read at most MAX_BYTES+1 from stdin; refuse if we got more than MAX_BYTES."""
+    data = sys.stdin.buffer.read(MAX_BYTES + 1)
+    if len(data) > MAX_BYTES:
+        fail(f"refusing: input exceeds {MAX_BYTES} bytes")
+    if not data.strip():
+        fail("refusing: empty input on stdin", code=65)
+    return data
+
+
+def parse_yaml(data: bytes) -> dict:
+    try:
+        loaded = yaml.safe_load(data)
+    except yaml.YAMLError as e:
+        fail(f"refusing: stdin is not valid YAML: {e}")
+    if not isinstance(loaded, dict):
+        fail(f"refusing: top-level YAML must be a mapping, got {type(loaded).__name__}")
+    return loaded  # type: ignore[return-value]
+
+
+def validate_shape(data: dict, plan_name: str) -> None:
+    # Required: plan_name field must equal what was passed on the command line.
+    if "plan_name" not in data:
+        fail("refusing: YAML missing required 'plan_name' field")
+    if data["plan_name"] != plan_name:
+        fail(f"refusing: YAML plan_name {data['plan_name']!r} does not match "
+             f"argv plan {plan_name!r}")
+
+    # Required: sources must be a non-empty list of strings.
+    if "sources" not in data or not isinstance(data["sources"], list):
+        fail("refusing: YAML missing required 'sources' list")
+    if not data["sources"]:
+        fail("refusing: 'sources' list is empty")
+    for s in data["sources"]:
+        if not isinstance(s, str):
+            fail(f"refusing: 'sources' contains non-string element {s!r}")
+
+    # Optional but type-constrained: any of the expected top-level keys we
+    # recognise must have the right type. Unknown keys pass through (newer
+    # config schemas may add fields).
+    for key, expected_type in _EXPECTED_TYPES.items():
+        if key in data and not isinstance(data[key], expected_type):
+            fail(f"refusing: field {key!r} has wrong type "
+                 f"(got {type(data[key]).__name__}, expected "
+                 f"{expected_type.__name__ if isinstance(expected_type, type) else expected_type})")
+
+
+def write_atomic(target_path: str, data: bytes) -> None:
+    """Atomic write: tempfile in same dir, fsync, rename, fsync parent."""
+    target_dir = os.path.dirname(target_path)
+    if not os.path.isdir(target_dir):
+        fail(f"destination dir does not exist: {target_dir}", code=3)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".timetraveller-write-",
+        suffix=".tmp",
+        dir=target_dir,
+    )
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_path, 0o644)
+        # Owner is whoever is running this helper (root, via pkexec). The
+        # explicit chown is belt-and-braces in case the helper is ever invoked
+        # outside pkexec.
+        os.chown(tmp_path, 0, 0)
+        os.replace(tmp_path, target_path)
+    except Exception:
+        # Best effort: don't leak the tempfile on the failure path.
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def main(argv: list[str]) -> int:
+    if os.geteuid() != 0:
+        fail("must be run as root (typically via pkexec)", code=4)
+
+    if len(argv) != 1:
+        fail("usage: timetraveller-write-system-config <plan>", code=64)
+
+    plan_name = argv[0]
+    validate_plan_name(plan_name)
+
+    raw = read_stdin_bounded()
+    data = parse_yaml(raw)
+    validate_shape(data, plan_name)
+
+    # Re-serialise from the validated dict so we don't faithfully echo back
+    # bytes the user could have crafted to embed something weird (anchors,
+    # unusual literal styles, etc). yaml.safe_dump is conservative.
+    canonical = yaml.safe_dump(data, sort_keys=False, default_flow_style=False).encode("utf-8")
+
+    target = os.path.join(ETC_DIR, f"{plan_name}.yaml")
+    write_atomic(target, canonical)
+    print(f"ok: wrote {target}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

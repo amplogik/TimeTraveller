@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+
+  <vendor>TimeTraveller</vendor>
+  <vendor_url>https://github.com/timetraveller</vendor_url>
+
+  <action id="com.timetraveller.write-system-config">
+    <description>Write a TimeTraveller system-class plan config</description>
+    <message>Authentication is required to save a system-class backup plan to /etc/timetraveller/.</message>
+
+    <defaults>
+      <!-- Disallow remote/inactive sessions. Active local session must auth
+           as an admin; auth is cached for 5 minutes (auth_admin_keep) so
+           consecutive operations don't re-prompt. -->
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+
+    <!-- The helper script we are authorising. PolicyKit will execute it as
+         root after a successful authentication. -->
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/timetraveller-write-system-config</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+
+</policyconfig>

@@ -8,10 +8,14 @@ Toolbar: Run Full, Run Incr, Dry Run, Show Mounts, Save.
 from __future__ import annotations
 
 import os
+import subprocess
+from dataclasses import asdict
 from pathlib import Path
 
+import yaml
+
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QAction, QKeySequence
+from PyQt6.QtGui import QAction, QBrush, QColor, QKeySequence
 from PyQt6.QtWidgets import (
     QInputDialog, QLabel, QListWidget, QMainWindow, QMessageBox, QSizePolicy,
     QSplitter, QStatusBar, QTabWidget, QToolBar, QVBoxLayout, QWidget,
@@ -162,7 +166,7 @@ class MainWindow(QMainWindow):
     # ---------- plan discovery + selection ----------
 
     def _config_path_for(self, plan_name: str) -> Path:
-        if plan_name == "system":
+        if plan_name in configlib.SYSTEM_PLAN_NAMES:
             return configlib.system_config_path(plan_name)
         return configlib.user_config_path(plan_name)
 
@@ -170,29 +174,39 @@ class MainWindow(QMainWindow):
         self._plan_list.clear()
         self._plans.clear()
         # Build a name → effective path map mirroring resolve_config_path:
-        # for "system", the /etc path wins; for every other plan name, the
-        # user path wins. Without this dedupe a user-level system.yaml and a
-        # system-level system.yaml both showed up in the list pointing at the
-        # same selection.
+        # for system-class plan names, the /etc path wins; for every other
+        # plan name, the user path wins. Without this dedupe a user-level
+        # system.yaml and an /etc/timetraveller/system.yaml both showed up in
+        # the list pointing at the same selection.
         candidates: dict[str, Path] = {}
         user_dir = configlib.user_config_path("dummy").parent
         if user_dir.exists():
             for f in sorted(user_dir.glob("*.yaml")):
                 candidates[f.stem] = f
-        sysp = configlib.system_config_path("system")
-        if sysp.exists() and os.access(sysp, os.R_OK):
-            shadowed = candidates.get("system")
-            candidates["system"] = sysp
-            if shadowed is not None and shadowed != sysp:
-                self.statusBar().showMessage(
-                    f"Note: {shadowed} is shadowed by {sysp}", 5000,
-                )
+        for name in sorted(configlib.SYSTEM_PLAN_NAMES):
+            sysp = configlib.system_config_path(name)
+            if sysp.exists() and os.access(sysp, os.R_OK):
+                shadowed = candidates.get(name)
+                candidates[name] = sysp
+                if shadowed is not None and shadowed != sysp:
+                    self.statusBar().showMessage(
+                        f"Note: {shadowed} is shadowed by {sysp}", 5000,
+                    )
         for name in sorted(candidates):
             path = candidates[name]
             try:
                 plan = configlib.load(path)
                 self._plans[plan.plan_name] = plan
                 self._plan_list.addItem(plan.plan_name)
+                if plan.plan_name in configlib.SYSTEM_PLAN_NAMES:
+                    item = self._plan_list.item(self._plan_list.count() - 1)
+                    # Warning-orange to flag plans that require root auth to
+                    # save or schedule. Tooltip explains.
+                    item.setForeground(QBrush(QColor("#cc7a00")))
+                    item.setToolTip(
+                        "Runs as root — saving and scheduling require admin "
+                        "authentication (pkexec)."
+                    )
             except Exception as e:  # noqa: BLE001
                 self.statusBar().showMessage(f"Skipped {path}: {e}", 5000)
 
@@ -248,18 +262,15 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Validation error", str(e))
             return
         path = self._config_path_for(merged.plan_name)
-        if merged.plan_name == "system" and not os.access(path.parent, os.W_OK):
-            QMessageBox.warning(
-                self, "Cannot save system plan",
-                f"This GUI cannot write {path} (root-owned). For now, edit it as root.\n"
-                f"In a future release a pkexec helper will handle this.",
-            )
-            return
-        try:
-            configlib.save(merged, path)
-        except OSError as e:
-            QMessageBox.critical(self, "Save failed", str(e))
-            return
+        if merged.plan_name in configlib.SYSTEM_PLAN_NAMES and not os.access(path.parent, os.W_OK):
+            if not self._save_system_plan_via_pkexec(merged):
+                return
+        else:
+            try:
+                configlib.save(merged, path)
+            except OSError as e:
+                QMessageBox.critical(self, "Save failed", str(e))
+                return
         self._plans[merged.plan_name] = merged
         self._dirty = False
         self.statusBar().showMessage(f"Saved {path}", 4000)
@@ -339,15 +350,15 @@ class MainWindow(QMainWindow):
     def _cron_binary_override(self) -> str | None:
         """Return a --binary-path to pass to --install-schedule, or None.
 
-        For SYSTEM plans we always defer to the worker's auto-detection — the
-        pkexec helper only accepts canonical installed paths.
+        For system-class plans we always defer to the worker's auto-detection —
+        the pkexec helper only accepts canonical installed paths.
 
-        For HOME plans we ALSO prefer the worker default when an installed
-        shim exists. Only when running from a bare checkout (no install.sh,
-        no .deb) do we fall back to the repo's bin/ shim so the user crontab
-        entry points at a real, executable script.
+        For user-crontab plans we ALSO prefer the worker default when an
+        installed shim exists. Only when running from a bare checkout (no
+        install.sh, no .deb) do we fall back to the repo's bin/ shim so the
+        user crontab entry points at a real, executable script.
         """
-        if self._current_plan_name == "system":
+        if self._current_plan_name in configlib.SYSTEM_PLAN_NAMES:
             return None
         for path in ("/usr/bin/timetraveller-backup",
                      "/usr/local/bin/timetraveller-backup"):
@@ -355,6 +366,38 @@ class MainWindow(QMainWindow):
                 return None
         repo_root = Path(__file__).resolve().parents[2]
         return str(repo_root / "bin" / "timetraveller-backup")
+
+    # Path to the pkexec helper that writes /etc/timetraveller/<plan>.yaml.
+    # Hardcoded — the polkit policy authorises this exact path.
+    _WRITE_CONFIG_HELPER = "/usr/libexec/timetraveller-write-system-config"
+
+    def _save_system_plan_via_pkexec(self, plan: PlanConfig) -> bool:
+        """Save a system-class plan by piping its YAML through pkexec.
+
+        Returns True on success, False on error or user cancel. Blocks the GUI
+        thread for the duration of the pkexec auth prompt; the helper itself
+        finishes in well under a second.
+        """
+        # Validate before invoking pkexec so we don't auth-prompt just to fail
+        # at the helper's shape check.
+        try:
+            plan.validate()
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Validation error", str(e))
+            return False
+        body = yaml.safe_dump(asdict(plan), sort_keys=False, default_flow_style=False)
+        r = subprocess.run(
+            ["pkexec", self._WRITE_CONFIG_HELPER, plan.plan_name],
+            input=body, text=True, capture_output=True,
+        )
+        if r.returncode != 0:
+            detail = (r.stderr or r.stdout or "").strip() or f"helper exited {r.returncode}"
+            QMessageBox.critical(
+                self, f"Save {plan.plan_name} plan failed",
+                f"pkexec helper exited {r.returncode}.\n\n{detail}",
+            )
+            return False
+        return True
 
     def _confirm_save_before_install(self) -> bool:
         r = QMessageBox.question(
@@ -492,18 +535,18 @@ class MainWindow(QMainWindow):
         if plan is None:
             return
 
-        # System plans live in /etc/timetraveller/ and require root to delete.
-        # Rather than silently disabling the button, give the user a concrete
-        # next step.
-        if plan.plan_name == "system":
+        # System-class plans live in /etc/timetraveller/ and require root to
+        # delete. Rather than silently disabling the button, give the user a
+        # concrete next step.
+        if plan.plan_name in configlib.SYSTEM_PLAN_NAMES:
             path = self._config_path_for(plan.plan_name)
             QMessageBox.information(
-                self, "Cannot remove system plan",
-                f"System plans live in <code>/etc/timetraveller/</code>. "
+                self, f"Cannot remove {plan.plan_name} plan",
+                f"System-class plans live in <code>/etc/timetraveller/</code>. "
                 f"This GUI cannot write there. Remove it as root:<br><br>"
                 f"<code>sudo rm {path}</code><br><br>"
                 f"Then also uninstall its cron entries:<br>"
-                f"<code>sudo timetraveller-backup --plan system "
+                f"<code>sudo timetraveller-backup --plan {plan.plan_name} "
                 f"--uninstall-schedule</code>",
             )
             return
@@ -562,19 +605,30 @@ class MainWindow(QMainWindow):
     # ---------- new plan ----------
 
     def _new_plan(self) -> None:
-        choices = ["home (default)", "system (default)", "custom…"]
+        choices = [
+            "home (default — your /home/$USER)",
+            "homes (default — all users' /home, runs as root)",
+            "system (default — /, runs as root, excludes /home)",
+            "custom…",
+        ]
         choice, ok = QInputDialog.getItem(
             self, "New plan", "Create a plan from:", choices, 0, editable=False,
         )
         if not ok:
             return
-        if choice.startswith("home"):
+        if choice.startswith("home "):
             plan = configlib.defaults_home()
             if plan.plan_name in self._plans:
                 QMessageBox.warning(self, "Plan exists",
                                     f"Plan {plan.plan_name!r} already exists.")
                 return
-        elif choice.startswith("system"):
+        elif choice.startswith("homes "):
+            plan = configlib.defaults_homes()
+            if plan.plan_name in self._plans:
+                QMessageBox.warning(self, "Plan exists",
+                                    f"Plan {plan.plan_name!r} already exists.")
+                return
+        elif choice.startswith("system "):
             plan = configlib.defaults_system()
             if plan.plan_name in self._plans:
                 QMessageBox.warning(self, "Plan exists",
@@ -617,17 +671,15 @@ class MainWindow(QMainWindow):
             plan.plan_name = name
 
         path = self._config_path_for(plan.plan_name)
-        if plan.plan_name == "system" and not os.access(path.parent.parent, os.W_OK):
-            QMessageBox.warning(
-                self, "Cannot create system plan",
-                f"This GUI cannot write {path}. Create it as root for now.",
-            )
-            return
-        try:
-            configlib.save(plan, path)
-        except OSError as e:
-            QMessageBox.critical(self, "Create failed", str(e))
-            return
+        if plan.plan_name in configlib.SYSTEM_PLAN_NAMES and not os.access(path.parent, os.W_OK):
+            if not self._save_system_plan_via_pkexec(plan):
+                return
+        else:
+            try:
+                configlib.save(plan, path)
+            except OSError as e:
+                QMessageBox.critical(self, "Create failed", str(e))
+                return
         self._discover_plans()
         items = self._plan_list.findItems(plan.plan_name, Qt.MatchFlag.MatchExactly)
         if items:

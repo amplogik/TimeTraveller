@@ -14,6 +14,11 @@ COMPRESSIONS = ("zstd", "gzip", "none")
 SCHEDULE_MODES = ("weekly", "monthly", "archive")
 INCR_MODES = ("weekdays", "except_full", "every_n_days", "disabled")
 
+# Plans whose YAML lives at /etc/timetraveller/<name>.yaml and whose cron block
+# lives in root's crontab. Routes through pkexec helpers. The libexec helpers
+# hardcode the same allowlist for auditability and must be kept in sync.
+SYSTEM_PLAN_NAMES = frozenset({"system", "homes"})
+
 
 @dataclass
 class FullSchedule:
@@ -247,14 +252,25 @@ _SYSTEM_EXCLUDES = [
 
 
 def defaults_home() -> PlanConfig:
+    """Per-user default: just /home/$USER, runs as the invoking user."""
     return PlanConfig(
         plan_name="home",
+        sources=[str(Path.home())],
+        excludes=list(_HOME_EXCLUDES),
+    )
+
+
+def defaults_homes() -> PlanConfig:
+    """All-users-home default: /home, runs as root via the pkexec helpers."""
+    return PlanConfig(
+        plan_name="homes",
         sources=["/home"],
         excludes=list(_HOME_EXCLUDES),
     )
 
 
 def defaults_system() -> PlanConfig:
+    """OS-only default: / and /boot/efi, runs as root, excludes /home/**."""
     return PlanConfig(
         plan_name="system",
         sources=["/", "/boot/efi"],
@@ -274,8 +290,8 @@ def system_config_path(plan_name: str) -> Path:
 
 
 def resolve_config_path(plan_name: str) -> Path:
-    """Find a plan config. Looks at system path first for 'system', user path for others."""
-    if plan_name == "system":
+    """Find a plan config. Looks at /etc first for system-class plans, user path for others."""
+    if plan_name in SYSTEM_PLAN_NAMES:
         sp = system_config_path(plan_name)
         if sp.exists():
             return sp

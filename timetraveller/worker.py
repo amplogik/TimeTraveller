@@ -836,11 +836,11 @@ def _binary_path_for_cron(args: argparse.Namespace, plan: configlib.PlanConfig) 
     if args.binary_path:
         return args.binary_path
     if args.dev_binary_path:
-        if plan.plan_name == "system":
+        if plan.plan_name in configlib.SYSTEM_PLAN_NAMES:
             raise SystemExit(
-                "ERROR: --dev-binary-path is only allowed for the home plan. "
-                "The pkexec helper rejects non-canonical paths for security. "
-                "Install via install.sh or the .deb for system schedules."
+                f"ERROR: --dev-binary-path is not allowed for the {plan.plan_name!r} "
+                "plan. The pkexec helper rejects non-canonical paths for security. "
+                "Install via install.sh or the .deb for system-level plans."
             )
         return os.path.realpath(sys.argv[0])
     return _default_installed_binary()
@@ -882,11 +882,11 @@ def action_install_schedule(args: argparse.Namespace, plan: configlib.PlanConfig
     bin_path = _binary_path_for_cron(args, plan)
     block = schedulelib.render_block(plan, bin_path)
 
-    if plan.plan_name == "system":
+    if plan.plan_name in configlib.SYSTEM_PLAN_NAMES:
         # Delegate to pkexec helper. The helper reads root's crontab, swaps
         # the plan's managed block, validates, and writes back.
         import subprocess
-        _log(args, f"Installing system schedule via pkexec {PKEXEC_HELPER_PATH}")
+        _log(args, f"Installing {plan.plan_name} schedule via pkexec {PKEXEC_HELPER_PATH}")
         r = subprocess.run(
             ["pkexec", PKEXEC_HELPER_PATH, "install", plan.plan_name],
             input=block, text=True, capture_output=True,
@@ -919,9 +919,9 @@ def _toggle_schedule(args: argparse.Namespace, plan: configlib.PlanConfig,
                      mode: str) -> int:
     """Shared implementation for suspend and resume."""
     assert mode in ("suspend", "resume")
-    if plan.plan_name == "system":
+    if plan.plan_name in configlib.SYSTEM_PLAN_NAMES:
         import subprocess
-        _log(args, f"{mode} system schedule via pkexec {PKEXEC_HELPER_PATH}")
+        _log(args, f"{mode} {plan.plan_name} schedule via pkexec {PKEXEC_HELPER_PATH}")
         r = subprocess.run(
             ["pkexec", PKEXEC_HELPER_PATH, mode, plan.plan_name],
             text=True, capture_output=True,
@@ -933,7 +933,7 @@ def _toggle_schedule(args: argparse.Namespace, plan: configlib.PlanConfig,
             return r.returncode
         return 0
 
-    # Home plan: edit user crontab directly.
+    # User-crontab plans: edit user crontab directly.
     current = _read_user_crontab()
     if schedulelib.find_block(current, plan.plan_name) is None:
         print(f"No managed block for plan {plan.plan_name!r}; nothing to {mode}.",
@@ -965,9 +965,9 @@ def action_resume_schedule(args, plan):
 
 
 def action_uninstall_schedule(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
-    if plan.plan_name == "system":
+    if plan.plan_name in configlib.SYSTEM_PLAN_NAMES:
         import subprocess
-        _log(args, f"Removing system schedule via pkexec {PKEXEC_HELPER_PATH}")
+        _log(args, f"Removing {plan.plan_name} schedule via pkexec {PKEXEC_HELPER_PATH}")
         r = subprocess.run(
             ["pkexec", PKEXEC_HELPER_PATH, "uninstall", plan.plan_name],
             text=True, capture_output=True,

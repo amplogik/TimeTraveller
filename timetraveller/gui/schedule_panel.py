@@ -37,11 +37,24 @@ from PyQt6.QtWidgets import (
     QTimeEdit, QVBoxLayout, QWidget,
 )
 
-from ..config import WEEKDAYS, FullSchedule, IncrSchedule, PlanConfig, Schedule
+from ..config import SYSTEM_PLAN_NAMES, WEEKDAYS, FullSchedule, IncrSchedule, PlanConfig, Schedule
 from ..schedule import find_block, is_block_suspended, render_block
 
 DAY_LABELS = [("mon", "Mon"), ("tue", "Tue"), ("wed", "Wed"), ("thu", "Thu"),
               ("fri", "Fri"), ("sat", "Sat"), ("sun", "Sun")]
+
+
+# Section-header style: bold, ~25% larger than the default control font.
+# Applied via QLabel.setStyleSheet so the two section headers ("Full backup"
+# and "Incremental backup") match visually regardless of the system theme.
+_SECTION_HEADER_CSS = "font-weight: bold; font-size: 13pt;"
+
+# Vertical breathing room above each section header.
+_SECTION_SPACING = 12
+
+
+def _style_section_header_label(label: QLabel) -> None:
+    label.setStyleSheet(_SECTION_HEADER_CSS)
 
 
 def _make_weekday_row(parent_layout) -> dict[str, QCheckBox]:
@@ -64,8 +77,11 @@ class _WeeklyPage(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        full_box = QGroupBox("Full backup")
-        fl = QVBoxLayout(full_box)
+        # Full backup contents — unboxed; the SchedulePanel hoists the "Full
+        # backup" header out so it can sit above the schedule-mode radio.
+        full_w = QWidget()
+        fl = QVBoxLayout(full_w)
+        fl.setContentsMargins(0, 0, 0, 0)
         fl.addWidget(QLabel("Run on these weekday(s):"))
         self.full_days = _make_weekday_row(fl)
         time_row = QHBoxLayout()
@@ -75,10 +91,17 @@ class _WeeklyPage(QWidget):
         time_row.addWidget(self.full_time)
         time_row.addStretch(1)
         fl.addLayout(time_row)
-        layout.addWidget(full_box)
+        layout.addWidget(full_w)
 
-        incr_box = QGroupBox("Incremental backup")
-        il = QVBoxLayout(incr_box)
+        # Incremental backup section. Parallel to Full backup: a styled label
+        # header (with breathing room above) and unframed contents below.
+        incr_header = QLabel("Incremental backup")
+        _style_section_header_label(incr_header)
+        layout.addSpacing(_SECTION_SPACING)
+        layout.addWidget(incr_header)
+        incr_w = QWidget()
+        il = QVBoxLayout(incr_w)
+        il.setContentsMargins(0, 0, 0, 0)
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("Run:"))
         self.incr_except = QRadioButton("Every day except full days")
@@ -100,7 +123,7 @@ class _WeeklyPage(QWidget):
         time_row.addWidget(self.incr_time)
         time_row.addStretch(1)
         il.addLayout(time_row)
-        layout.addWidget(incr_box)
+        layout.addWidget(incr_w)
         layout.addStretch(1)
 
         # Wire change signals.
@@ -134,8 +157,11 @@ class _MonthlyPage(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        full_box = QGroupBox("Full backup")
-        fl = QFormLayout(full_box)
+        # Full backup contents — unboxed; the SchedulePanel hoists the "Full
+        # backup" header out so it can sit above the schedule-mode radio.
+        full_w = QWidget()
+        fl = QFormLayout(full_w)
+        fl.setContentsMargins(0, 0, 0, 0)
         self.full_dom = QSpinBox()
         self.full_dom.setRange(1, 28)
         self.full_dom.setSuffix("  (1-28; capped to avoid month-end surprises)")
@@ -143,10 +169,17 @@ class _MonthlyPage(QWidget):
         self.full_time.setDisplayFormat("HH:mm")
         fl.addRow("Day of month:", self.full_dom)
         fl.addRow("Time:", self.full_time)
-        layout.addWidget(full_box)
+        layout.addWidget(full_w)
 
-        incr_box = QGroupBox("Incremental backup")
-        il = QVBoxLayout(incr_box)
+        # Incremental backup section. Parallel to Full backup: a styled label
+        # header (with breathing room above) and unframed contents below.
+        incr_header = QLabel("Incremental backup")
+        _style_section_header_label(incr_header)
+        layout.addSpacing(_SECTION_SPACING)
+        layout.addWidget(incr_header)
+        incr_w = QWidget()
+        il = QVBoxLayout(incr_w)
+        il.setContentsMargins(0, 0, 0, 0)
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("Run:"))
         self.incr_every_n = QRadioButton("Every N days")
@@ -181,7 +214,7 @@ class _MonthlyPage(QWidget):
         time_row.addWidget(self.incr_time)
         time_row.addStretch(1)
         il.addLayout(time_row)
-        layout.addWidget(incr_box)
+        layout.addWidget(incr_w)
         layout.addStretch(1)
 
         self.full_dom.valueChanged.connect(self.changed.emit)
@@ -220,11 +253,19 @@ class SchedulePanel(QWidget):
 
         layout = QVBoxLayout(self)
 
+        # Section header for the Full backup area. Hoisted up here (above the
+        # Schedule mode radio) so users see "Full backup" before being asked
+        # how its cadence should be picked. Hidden when an archive plan is
+        # loaded — see load_plan.
+        self._full_header = QLabel("Full backup")
+        _style_section_header_label(self._full_header)
+        layout.addWidget(self._full_header)
+
         # Top: mode radio. Hidden when an archive plan is loaded.
         self._mode_row_w = QWidget()
         mode_row = QHBoxLayout(self._mode_row_w)
         mode_row.setContentsMargins(0, 0, 0, 0)
-        mode_row.addWidget(QLabel("<b>Schedule mode:</b>"))
+        mode_row.addWidget(QLabel("Schedule mode:"))
         self.mode_weekly = QRadioButton("Weekly")
         self.mode_monthly = QRadioButton("Monthly")
         self._mode_group = QButtonGroup(self)
@@ -308,6 +349,7 @@ class SchedulePanel(QWidget):
         # Archive plans replace the entire schedule editor with a notice and
         # disable the install/suspend buttons (cron is not used).
         is_archive = sch.mode == "archive"
+        self._full_header.setVisible(not is_archive)
         self._mode_row_w.setVisible(not is_archive)
         self._stack.setVisible(not is_archive)
         self._preview_box.setVisible(not is_archive)
@@ -464,7 +506,7 @@ class SchedulePanel(QWidget):
         """
         if not self._plan:
             return
-        if self._plan.plan_name == "system":
+        if self._plan.plan_name in SYSTEM_PLAN_NAMES:
             self._status_label.setText("<i>Unknown</i> (root-owned crontab; "
                                        "use the buttons to manage)")
             for b in (self._install_btn, self._uninstall_btn,
