@@ -64,6 +64,11 @@ def build_parser() -> argparse.ArgumentParser:
     actions.add_argument("--reindex", nargs="?", const="*", default=None,
                          help="Regenerate .idx.zst sidecar(s). With no arg, fixes missing sidecars. "
                               "Pass an archive filename to force-regenerate one.")
+    actions.add_argument("--finalize-archive", metavar="FILE", default=None,
+                         help="Finalize the manifest entry for an archive whose run crashed "
+                              "between archive-write and manifest-save. Backfills status, "
+                              "date_finished, size_bytes, has_sidecar, has_frames from what's "
+                              "on disk. Run --reindex first if the sidecar also needs regenerating.")
     actions.add_argument("--verify", type=str, default=None,
                          help="Stream the named archive through pax -r to /dev/null to check integrity.")
     actions.add_argument("--extract", type=str, default=None, metavar="ARCHIVE",
@@ -143,6 +148,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-framed", action="store_true",
                    help="Disable framed-zstd output for this run. Single-file restore "
                         "from the resulting archive will require a full archive read.")
+    p.add_argument("--status", choices=("ok", "ok-with-warnings", "failed"),
+                   default="ok-with-warnings",
+                   help="With --finalize-archive: status to record on the entry. Default "
+                        "'ok-with-warnings' is conservative for crash recovery — pax may "
+                        "have emitted non-fatal warnings whose result is no longer available.")
+    p.add_argument("--force", action="store_true",
+                   help="With --finalize-archive: allow overwriting an entry that already "
+                        "has a terminal status (ok / ok-with-warnings / failed / empty).")
     p.add_argument("--manual", action="store_true",
                    help="Mark this as a manual (not scheduled) run; uses HHMMSS in the filename "
                         "to avoid colliding with same-day scheduled runs.")
@@ -534,6 +547,48 @@ def action_reindex(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
             entry.has_sidecar = True
         _mirror_sidecar(plan.plan_name, indexlib.sidecar_path(a), a.name)
     _save_manifest(m, archive_dir, plan.plan_name)
+    return 0
+
+
+def action_finalize_archive(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
+    archive_dir = plan.archive_dir()
+    archive_path = archive_dir / args.finalize_archive
+    if not archive_path.exists():
+        print(f"ERROR: archive not found: {archive_path}", file=sys.stderr)
+        return 1
+
+    m = manifestlib.load(manifestlib.manifest_path(archive_dir))
+    entry = next((a for a in m.archives if a.filename == archive_path.name), None)
+    if entry is None:
+        print(f"ERROR: no manifest entry for {archive_path.name}. "
+              f"--finalize-archive updates an existing row; it does not create one.",
+              file=sys.stderr)
+        return 1
+
+    terminal = ("ok", "ok-with-warnings", "failed", "empty")
+    if entry.status in terminal and not args.force:
+        print(f"ERROR: entry status is already {entry.status!r}. "
+              f"Pass --force to overwrite.", file=sys.stderr)
+        return 1
+
+    sidecar = indexlib.sidecar_path(archive_path)
+    frames = framewriter.sidecar_path(archive_path)
+
+    entry.status = args.status
+    entry.date_finished = datetime.now(timezone.utc).isoformat()
+    entry.size_bytes = archive_path.stat().st_size
+    entry.has_sidecar = sidecar.exists()
+    entry.has_frames = frames.exists()
+
+    if entry.has_sidecar:
+        _mirror_sidecar(plan.plan_name, sidecar, archive_path.name)
+
+    _save_manifest(m, archive_dir, plan.plan_name)
+
+    _log(args, f"finalize: {archive_path.name}")
+    _log(args, f"  status={entry.status}  size={entry.size_bytes/1024**2:.1f} MiB  "
+               f"date_finished={entry.date_finished}")
+    _log(args, f"  has_sidecar={entry.has_sidecar}  has_frames={entry.has_frames}")
     return 0
 
 
@@ -1288,6 +1343,8 @@ def main(argv: list[str] | None = None) -> int:
         return action_list_files(args, plan)
     if args.reindex is not None:
         return action_reindex(args, plan)
+    if args.finalize_archive:
+        return action_finalize_archive(args, plan)
     if args.verify:
         return action_verify(args, plan)
     if args.extract:

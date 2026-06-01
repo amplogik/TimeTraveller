@@ -1,3 +1,19 @@
+timetraveller (1.0.3) unstable; urgency=medium
+
+  * New --finalize-archive action for post-crash manifest fix-up. When a
+    backup run crashes between archive-write and manifest-save (e.g. a
+    desktop crash during sidecar generation on a large full), the archive
+    file itself is intact but the manifest entry stays in 'in-progress'
+    with no date_finished, has_sidecar, has_frames, or size_bytes. The
+    new action backfills those fields from what's on disk: status from
+    --status (default 'ok-with-warnings'), date_finished=now, size_bytes
+    from stat, has_sidecar/has_frames from sidecar presence. Pair with
+    --reindex first if the .idx.zst sidecar also needs regenerating.
+    --force allows overwriting an entry that already has a terminal
+    status (otherwise refused as a typo-guard).
+
+ -- Kim McCann <amplogik@gmail.com>  Sun, 31 May 2026 19:45:00 -0700
+
 timetraveller (1.0.2) unstable; urgency=medium
 
   * System-class plans are now plural. A new "homes" default plan backs up
