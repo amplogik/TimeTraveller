@@ -1,3 +1,34 @@
+timetraveller (1.0.4) unstable; urgency=medium
+
+  * GUI: Reindex button on the Archives panel for archives that are
+    missing their .idx.zst sidecar. Launches the worker as a detached
+    process (its own session group) so the long-running reindex
+    survives a GUI exit. The label changes to "Indexing now" while a
+    reindex is in flight, restored to the idle warning on completion
+    (success refreshes the archive listing and re-selects the archive;
+    failure pops a modal with the log tail and re-offers the button
+    for retry). Per-(plan, archive) pid/log/done state files under
+    XDG_STATE_HOME let a fresh GUI session adopt a still-running
+    reindex launched by a prior session. Failed archives (status =
+    "failed") are explicitly carved out — the archive file is at
+    `.failed` suffix on disk and the worker's --reindex would not
+    find it; those entries show "backup failed; archive incomplete"
+    with no button.
+  * GUI: cross-archive file search in the Archives panel. A new
+    "Search files…" button toggles the right pane from the per-archive
+    file tree to a grouped search-results view. Each matching file
+    path becomes a top-level row; under it, one row per archive that
+    contains a copy, with size and mtime-at-backup so the user can
+    pick the right version to restore. Streaming sidecar scan with a
+    bytes-level case-folded substring prefilter keeps the search
+    sub-second per million-entry sidecar; results are off-thread in a
+    QThread worker. Min 3 chars, capped at 500 distinct paths.
+    Activating a version row exits search, selects the archive on the
+    left, and scrolls the file tree to the path so Extract is one
+    click away.
+
+ -- Kim McCann <amplogik@gmail.com>  Sun, 31 May 2026 20:51:00 -0700
+
 timetraveller (1.0.3) unstable; urgency=medium
 
   * New --finalize-archive action for post-crash manifest fix-up. When a

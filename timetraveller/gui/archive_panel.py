@@ -13,11 +13,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QModelIndex, QObject, Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView, QHBoxLayout, QHeaderView, QLabel, QMessageBox,
-    QPushButton, QSplitter, QTreeView, QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout, QWidget,
+    QPushButton, QSplitter, QStackedWidget, QTreeView, QTreeWidget,
+    QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from ..archive import CycleListing, IndexNode, list_from_manifest, load_sidecar_tree
@@ -25,7 +25,9 @@ from ..config import PlanConfig
 from ..index import sidecar_mirror_path
 from ..manifest import ArchiveEntry
 from .archive_tree_model import ArchiveTreeModel
+from .reindex_tracker import ReindexTracker
 from .restore_dialog import RestoreDialog
+from .search_widget import SearchWidget
 
 
 class _SidecarLoadWorker(QObject):
@@ -58,7 +60,7 @@ class ArchivePanel(QWidget):
 
     restore_requested = pyqtSignal()  # emitted after a successful extract
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, tracker: ReindexTracker | None = None):
         super().__init__(parent)
         self._plan: PlanConfig | None = None
         self._current_entry: ArchiveEntry | None = None
@@ -68,6 +70,7 @@ class ArchivePanel(QWidget):
         # Tracks the archive whose sidecar load is currently in flight, so we
         # can ignore late-arriving results from a previous selection.
         self._pending_archive: str | None = None
+        self._tracker = tracker
 
         layout = QVBoxLayout(self)
 
@@ -82,21 +85,58 @@ class ArchivePanel(QWidget):
         self._archive_list.itemSelectionChanged.connect(self._on_archive_selection)
         splitter.addWidget(self._archive_list)
 
-        # Right: file tree.
-        right = QWidget()
-        rv = QVBoxLayout(right)
+        # Right: a stack with two pages —
+        #   page 0 (browse): file tree of the selected archive
+        #   page 1 (search): cross-archive file search
+        # A "Search files…" button on the browse header swaps the stack
+        # to page 1; SearchWidget's close button / Esc swaps it back.
+        self._right_stack = QStackedWidget()
+
+        # ----- browse page (page 0) -----
+        browse_page = QWidget()
+        rv = QVBoxLayout(browse_page)
         rv.setContentsMargins(0, 0, 0, 0)
 
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
         self._archive_label = QLabel("(no archive selected)")
         self._archive_label.setStyleSheet("padding: 4px;")
-        rv.addWidget(self._archive_label)
+        header_row.addWidget(self._archive_label, 1)
+        self._reindex_btn = QPushButton("Reindex")
+        self._reindex_btn.setVisible(False)
+        self._reindex_btn.clicked.connect(self._on_reindex_clicked)
+        header_row.addWidget(self._reindex_btn)
+        self._search_btn = QPushButton("🔍 Search files…")
+        self._search_btn.setToolTip(
+            "Find a filename across every archive in this plan"
+        )
+        self._search_btn.clicked.connect(self._enter_search_mode)
+        header_row.addWidget(self._search_btn)
+        rv.addLayout(header_row)
+
+        if self._tracker is not None:
+            self._tracker.started.connect(self._on_reindex_started)
+            self._tracker.finished.connect(self._on_reindex_finished)
 
         self._file_tree = QTreeView()
         self._file_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self._file_tree.setUniformRowHeights(True)
         rv.addWidget(self._file_tree, 1)
-        splitter.addWidget(right)
+        self._right_stack.addWidget(browse_page)
+
+        # ----- search page (page 1) -----
+        self._search_widget = SearchWidget()
+        self._search_widget.back_requested.connect(self._exit_search_mode)
+        self._search_widget.result_activated.connect(self._on_search_result_activated)
+        self._right_stack.addWidget(self._search_widget)
+
+        splitter.addWidget(self._right_stack)
         splitter.setStretchFactor(1, 1)
+
+        # When a sidecar load completes for an archive that the user just
+        # navigated to via search, scroll/highlight this path after the
+        # tree model is populated.
+        self._pending_highlight_path: str | None = None
 
         # Bottom toolbar.
         bottom = QHBoxLayout()
@@ -124,8 +164,15 @@ class ArchivePanel(QWidget):
         self._archive_list.clear()
         self._set_file_tree(None)
         if not self._plan:
+            self._search_widget.set_plan("", [])
             return
         listing = list_from_manifest(self._plan.plan_name, self._plan.archive_dir())
+        all_entries: list[ArchiveEntry] = []
+        for c in listing.cycles:
+            if c.full is not None:
+                all_entries.append(c.full)
+            all_entries.extend(c.incrementals)
+        self._search_widget.set_plan(self._plan.plan_name, all_entries)
         if not listing.cycles:
             placeholder = QTreeWidgetItem([
                 "(no archives in local mirror — run "
@@ -186,12 +233,14 @@ class ArchivePanel(QWidget):
             return
 
         if not entry.has_sidecar:
-            self._archive_label.setText(
-                f"<b>{entry.filename}</b> — no sidecar index (run --reindex)"
-            )
+            self._show_no_sidecar(entry)
             self._set_file_tree(None)
             self._pending_archive = None
             return
+
+        # Sidecar is recorded; hide the button used for the missing-sidecar
+        # warning so it doesn't linger over a healthy archive's pane.
+        self._reindex_btn.setVisible(False)
 
         sc = sidecar_mirror_path(self._plan.plan_name, entry.filename)
         if not sc.exists():
@@ -240,6 +289,11 @@ class ArchivePanel(QWidget):
         self._current_entry = entry
         self._set_file_tree(root)
         self._pending_archive = None
+        # If the selection was driven by a search-result click, scroll the
+        # newly-loaded tree to that path now that the model is in place.
+        if self._pending_highlight_path is not None:
+            self._scroll_to_path(self._pending_highlight_path)
+            self._pending_highlight_path = None
 
     def _on_sidecar_failed(self, archive_filename: str, msg: str) -> None:
         if archive_filename != self._pending_archive:
@@ -248,6 +302,172 @@ class ArchivePanel(QWidget):
         QMessageBox.warning(self, "Could not read sidecar", f"{sc}\n\n{msg}")
         self._set_file_tree(None)
         self._pending_archive = None
+
+    # ---------- reindex button ----------
+
+    def _show_no_sidecar(self, entry: ArchiveEntry) -> None:
+        """Render the no-sidecar warning, swapping in the running/idle state
+        from the tracker. Failed-status archives never get a Reindex button
+        because their archive file is at the .failed suffix on disk and the
+        worker's --reindex would fail to open it.
+        """
+        plan_name = self._plan.plan_name if self._plan else ""
+        running = (self._tracker.running_for(plan_name, entry.filename)
+                   if self._tracker else None)
+        if running is not None:
+            self._archive_label.setText(
+                f"<b>{entry.filename}</b> — no sidecar index (Indexing now)"
+            )
+            self._reindex_btn.setVisible(False)
+            return
+        if entry.status == "failed":
+            self._archive_label.setText(
+                f"<b>{entry.filename}</b> — backup failed; archive incomplete"
+            )
+            self._reindex_btn.setVisible(False)
+            return
+        self._archive_label.setText(
+            f"<b>{entry.filename}</b> — no sidecar index"
+        )
+        self._reindex_btn.setVisible(self._tracker is not None)
+
+    def _selected_archive_entry(self) -> ArchiveEntry | None:
+        items = self._archive_list.selectedItems()
+        if not items:
+            return None
+        data = items[0].data(0, Qt.ItemDataRole.UserRole)
+        return data if isinstance(data, ArchiveEntry) else None
+
+    def _on_reindex_clicked(self) -> None:
+        if self._plan is None or self._tracker is None:
+            return
+        entry = self._selected_archive_entry()
+        if entry is None or entry.has_sidecar:
+            return
+        handle = self._tracker.start(self._plan.plan_name, entry.filename)
+        if handle is None:
+            QMessageBox.warning(
+                self, "Reindex failed to launch",
+                f"Could not start reindex for {entry.filename}.",
+            )
+            return
+        # Repaint immediately for the user who just clicked; the tracker's
+        # `started` signal will also fire and is idempotent for this archive.
+        self._show_no_sidecar(entry)
+
+    def _on_reindex_started(self, plan_name: str, archive: str) -> None:
+        if self._plan is None or plan_name != self._plan.plan_name:
+            return
+        entry = self._selected_archive_entry()
+        if entry is not None and entry.filename == archive and not entry.has_sidecar:
+            self._show_no_sidecar(entry)
+
+    def _on_reindex_finished(self, plan_name: str, archive: str,
+                             ok: bool, log_tail: str) -> None:
+        if self._plan is None or plan_name != self._plan.plan_name:
+            return
+        if not ok:
+            QMessageBox.warning(
+                self, f"Reindex failed: {archive}",
+                f"{archive}\n\n{log_tail or '(no output captured)'}",
+            )
+            # Restore the idle warning so the button reappears for retry.
+            entry = self._selected_archive_entry()
+            if entry is not None and entry.filename == archive and not entry.has_sidecar:
+                self._show_no_sidecar(entry)
+            return
+        # Success: --reindex flipped has_sidecar in the manifest mirror;
+        # reload the listing and re-select the archive so the file tree
+        # loads automatically.
+        was_selected = self._selected_archive_entry()
+        target = archive if (was_selected and was_selected.filename == archive) else None
+        self.refresh()
+        if target is not None:
+            self._select_archive(target)
+
+    def _select_archive(self, filename: str) -> None:
+        for i in range(self._archive_list.topLevelItemCount()):
+            top = self._archive_list.topLevelItem(i)
+            for j in range(top.childCount()):
+                child = top.child(j)
+                data = child.data(0, Qt.ItemDataRole.UserRole)
+                if isinstance(data, ArchiveEntry) and data.filename == filename:
+                    # Clearing _current_entry forces _on_archive_selection
+                    # to re-render rather than bailing on the same-entry guard.
+                    self._current_entry = None
+                    self._archive_list.setCurrentItem(child)
+                    return
+
+    # ---------- search ----------
+
+    def _enter_search_mode(self) -> None:
+        self._right_stack.setCurrentIndex(1)
+        self._search_widget.focus_input()
+
+    def _exit_search_mode(self) -> None:
+        self._right_stack.setCurrentIndex(0)
+
+    def _on_search_result_activated(self, archive: str, path: str) -> None:
+        # Stash the highlight target before triggering selection so that
+        # the async sidecar load can pick it up on completion.
+        self._pending_highlight_path = path
+        self._exit_search_mode()
+        if self._current_entry is not None and self._current_entry.filename == archive:
+            # Tree already loaded — scroll now, no need to wait for async load.
+            self._scroll_to_path(path)
+            self._pending_highlight_path = None
+            return
+        self._select_archive(archive)
+
+    def _scroll_to_path(self, path: str) -> None:
+        """Locate `path` (e.g. './home/kim/recipe.md') in the loaded tree
+        and scroll/highlight it. Expands every ancestor along the way."""
+        if self._tree_model is None:
+            return
+        idx = self._index_for_path(path)
+        if not idx.isValid():
+            return
+        # Expand ancestors so the leaf is visible.
+        cursor = idx.parent()
+        ancestors = []
+        while cursor.isValid():
+            ancestors.append(cursor)
+            cursor = cursor.parent()
+        for anc in reversed(ancestors):
+            self._file_tree.expand(anc)
+        self._file_tree.scrollTo(
+            idx, QAbstractItemView.ScrollHint.PositionAtCenter
+        )
+        sel = self._file_tree.selectionModel()
+        if sel is not None:
+            sel.setCurrentIndex(
+                idx,
+                sel.SelectionFlag.ClearAndSelect | sel.SelectionFlag.Rows,
+            )
+
+    def _index_for_path(self, path: str) -> QModelIndex:
+        """Walk the model from the root, matching each path component
+        against children by name. Returns invalid QModelIndex on miss.
+        """
+        if self._tree_model is None:
+            return QModelIndex()
+        rel = path[2:] if path.startswith("./") else path.lstrip("/")
+        rel = rel.rstrip("/")
+        if not rel:
+            return QModelIndex()
+        parent_idx = QModelIndex()
+        for part in rel.split("/"):
+            found = QModelIndex()
+            for row in range(self._tree_model.rowCount(parent_idx)):
+                child_idx = self._tree_model.index(row, 0, parent_idx)
+                node = self._tree_model.node_at(child_idx)
+                if node is not None and node.name == part:
+                    found = child_idx
+                    break
+            if not found.isValid():
+                return QModelIndex()
+            parent_idx = found
+        return parent_idx
 
     def _set_file_tree(self, root: IndexNode | None) -> None:
         if root is None:
