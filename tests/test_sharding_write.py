@@ -124,6 +124,37 @@ def test_cli_extract_across_shards(tmp_path, monkeypatch):
         assert _sha(r) == _sha(Path("/") / r.relative_to(out))
 
 
+def test_merged_sidecar_tree_covers_all_shards(tmp_path, monkeypatch):
+    """The GUI merges shard sidecar trees into one; the union must equal the
+    whole backup's members."""
+    from timetraveller import archive as archivelib
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(worker, "_MIN_SHARD_BYTES", 1)
+    src = tmp_path / "src"
+    _make_tree(src)
+    plan = _plan(tmp_path / "dest", src, shards=3)
+    assert worker.action_backup(_args("full"), plan) == 0
+
+    adir = plan.archive_dir()
+    man = manifestlib.load(manifestlib.manifest_path(adir))
+    roots = [archivelib.load_sidecar_tree(indexlib.sidecar_path(adir / e.filename))
+             for e in man.archives]
+    merged = archivelib.merge_sidecar_trees(roots)
+
+    def paths(node, acc):
+        for c in node.children.values():
+            acc.add(c.full_path)
+            paths(c, acc)
+        return acc
+
+    expected = set(paxlib.iter_archivable_files([str(src)], [], [], mtime_window=None,
+                                                include_dirs=True, one_filesystem=True,
+                                                skip_special=True))
+    # Every member appears in the merged tree (it may also carry ancestor
+    # scaffolding nodes like ./tmp that aren't archive members themselves).
+    assert expected.issubset(paths(merged, set()))
+
+
 def test_unsharded_full_is_legacy_single_archive(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     monkeypatch.setattr(worker, "_MIN_SHARD_BYTES", 1)

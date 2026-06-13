@@ -20,7 +20,11 @@ from PyQt6.QtWidgets import (
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from ..archive import CycleListing, IndexNode, list_from_manifest, load_sidecar_tree
+from .. import manifest as manifestlib
+from ..archive import (
+    CycleListing, IndexNode, list_from_manifest, load_sidecar_tree,
+    merge_sidecar_trees,
+)
 from ..config import PlanConfig
 from ..index import sidecar_mirror_path
 from ..manifest import ArchiveEntry
@@ -31,28 +35,30 @@ from .search_widget import SearchWidget
 
 
 class _SidecarLoadWorker(QObject):
-    """Loads + parses an archive's .idx.zst sidecar off the Qt UI thread.
+    """Loads + parses a logical backup's .idx.zst sidecar(s) off the Qt UI
+    thread, merging the shards' trees into one.
 
     Sidecars for million-entry archives take a couple seconds to decompress
     and JSON-parse; doing that on the UI thread freezes the window long
     enough for the compositor to flag it as "Not Responding."
     """
 
-    loaded = pyqtSignal(str, object)   # (archive_filename, IndexNode root)
-    failed = pyqtSignal(str, str)      # (archive_filename, error message)
+    loaded = pyqtSignal(str, object)   # (group_id, merged IndexNode root)
+    failed = pyqtSignal(str, str)      # (group_id, error message)
 
-    def __init__(self, archive_filename: str, sidecar_path: Path):
+    def __init__(self, group_id: str, sidecar_paths: list[Path]):
         super().__init__()
-        self._archive_filename = archive_filename
-        self._sidecar_path = sidecar_path
+        self._group_id = group_id
+        self._sidecar_paths = sidecar_paths
 
     def run(self) -> None:
         try:
-            root = load_sidecar_tree(self._sidecar_path)
+            roots = [load_sidecar_tree(p) for p in self._sidecar_paths]
+            root = merge_sidecar_trees(roots)
         except Exception as exc:  # noqa: BLE001 - surface every failure
-            self.failed.emit(self._archive_filename, f"{type(exc).__name__}: {exc}")
+            self.failed.emit(self._group_id, f"{type(exc).__name__}: {exc}")
             return
-        self.loaded.emit(self._archive_filename, root)
+        self.loaded.emit(self._group_id, root)
 
 
 class ArchivePanel(QWidget):
@@ -64,13 +70,15 @@ class ArchivePanel(QWidget):
                  recover_tracker: RecoverTracker | None = None):
         super().__init__(parent)
         self._plan: PlanConfig | None = None
-        self._current_entry: ArchiveEntry | None = None
+        # The selected logical backup (a shard set; one shard for unsharded).
+        self._current_set: manifestlib.ShardSet | None = None
+        self._loading_set: manifestlib.ShardSet | None = None
         self._tree_model: ArchiveTreeModel | None = None
         self._load_thread: QThread | None = None
         self._load_worker: _SidecarLoadWorker | None = None
-        # Tracks the archive whose sidecar load is currently in flight, so we
-        # can ignore late-arriving results from a previous selection.
-        self._pending_archive: str | None = None
+        # Group id whose (merged) sidecar load is in flight, so we can ignore
+        # late-arriving results from a previous selection.
+        self._pending_group: str | None = None
         self._tracker = tracker
         self._recover_tracker = recover_tracker
 
@@ -206,75 +214,66 @@ class ArchivePanel(QWidget):
             top.setForeground(0, _color("#cc8000"))
         self._archive_list.addTopLevelItem(top)
 
-        # All shard entries (a sharded full lists every shard, not just the
-        # representative). Ordered: full shards first, then incrementals.
-        members = list(cycle.archives)
-        for entry in members:
-            size_str = _human(entry.size_bytes)
-            status_str = entry.status
-            child = QTreeWidgetItem([f"{entry.kind}  {entry.filename}", size_str, status_str])
-            child.setData(0, Qt.ItemDataRole.UserRole, entry)
-            if entry.status == "failed":
+        # One row per logical backup (shard set), not per shard file. A sharded
+        # full collapses to a single "(N shards)" row.
+        for s in manifestlib.group_into_sets(cycle.archives):
+            child = QTreeWidgetItem([_set_label(s), _human(s.total_size), s.status])
+            child.setData(0, Qt.ItemDataRole.UserRole, s)
+            if s.status == "failed":
                 child.setForeground(0, _color("#cf222e"))
                 child.setForeground(2, _color("#cf222e"))
-            elif entry.status == "empty":
+            elif s.status == "empty":
                 child.setForeground(0, _color("#6e7781"))
-            elif entry.status == "orphan":
+            elif s.status == "orphan":
                 child.setForeground(0, _color("#cc8000"))
             top.addChild(child)
 
     # ---------- file tree ----------
 
     def _on_archive_selection(self) -> None:
-        items = self._archive_list.selectedItems()
-        entry: ArchiveEntry | None = None
-        if items:
-            data = items[0].data(0, Qt.ItemDataRole.UserRole)
-            if isinstance(data, ArchiveEntry):
-                entry = data
-        if entry is None:
+        s = self._selected_set()
+        if s is None:
             self._set_file_tree(None)
-            self._pending_archive = None
+            self._pending_group = None
             return
-        if self._current_entry and entry.filename == self._current_entry.filename:
+        if self._current_set and s.group_id == self._current_set.group_id:
             return
-
         if not self._plan:
             return
 
-        if not entry.has_sidecar:
-            self._show_no_sidecar(entry)
+        # Every shard must be indexed before we can show the merged tree.
+        if not all(m.has_sidecar for m in s.members):
+            self._show_no_sidecar(s)
             self._set_file_tree(None)
-            self._pending_archive = None
+            self._pending_group = None
             return
 
-        # Sidecar is recorded; hide the recovery/reindex buttons so they don't
-        # linger over a healthy archive's pane.
         self._reindex_btn.setVisible(False)
         self._recover_btn.setVisible(False)
 
-        sc = sidecar_mirror_path(self._plan.plan_name, entry.filename)
-        if not sc.exists():
-            self._archive_label.setText(
-                f"<b>{entry.filename}</b> — sidecar missing from local mirror "
-                f"(run <code>--list-archives --refresh-from-mount</code>)"
-            )
-            self._set_file_tree(None)
-            self._pending_archive = None
-            return
+        # All shards' sidecars must be in the local mirror.
+        sidecars = []
+        for m in s.members:
+            sc = sidecar_mirror_path(self._plan.plan_name, m.filename)
+            if not sc.exists():
+                self._archive_label.setText(
+                    f"<b>{_set_label(s)}</b> — a sidecar is missing from the local "
+                    f"mirror (run <code>--list-archives --refresh-from-mount</code>)"
+                )
+                self._set_file_tree(None)
+                self._pending_group = None
+                return
+            sidecars.append(sc)
 
-        # Kick the actual sidecar load onto a worker thread so the UI stays
-        # responsive even on multi-million-entry sidecars.
+        # Load + merge the shard sidecars on a worker thread (responsive UI).
         self._archive_label.setText(
-            f"<b>{entry.filename}</b> &nbsp; — &nbsp; {_human(entry.size_bytes)} &nbsp; "
+            f"<b>{_set_label(s)}</b> &nbsp; — &nbsp; {_human(s.total_size)} &nbsp; "
             f"<i>(loading file tree…)</i>"
         )
         self._set_file_tree(None)
-        self._pending_archive = entry.filename
-        # If a previous load is still running, let it complete; we'll filter
-        # its result out via _pending_archive when it arrives.
+        self._pending_group = s.group_id
         self._load_thread = QThread(self)
-        self._load_worker = _SidecarLoadWorker(entry.filename, sc)
+        self._load_worker = _SidecarLoadWorker(s.group_id, sidecars)
         self._load_worker.moveToThread(self._load_thread)
         self._load_thread.started.connect(self._load_worker.run)
         self._load_worker.loaded.connect(self._on_sidecar_loaded)
@@ -283,112 +282,101 @@ class ArchivePanel(QWidget):
         self._load_worker.failed.connect(self._load_thread.quit)
         self._load_thread.finished.connect(self._load_worker.deleteLater)
         self._load_thread.finished.connect(self._load_thread.deleteLater)
-        # Stash the entry so _on_sidecar_loaded can promote it to current.
-        self._loading_entry = entry
+        self._loading_set = s
         self._load_thread.start()
 
-    def _on_sidecar_loaded(self, archive_filename: str, root: IndexNode) -> None:
-        # Drop the result if the user clicked another archive while this one
-        # was loading — the more recent click set a different _pending_archive.
-        if archive_filename != self._pending_archive:
+    def _on_sidecar_loaded(self, group_id: str, root: IndexNode) -> None:
+        # Drop the result if the user selected another backup while this one
+        # was loading.
+        if group_id != self._pending_group:
             return
-        entry = self._loading_entry
+        s = self._loading_set
+        shards = f" across {s.shard_count} shards" if s.shard_count > 1 else ""
         self._archive_label.setText(
-            f"<b>{entry.filename}</b> &nbsp; — &nbsp; {_human(entry.size_bytes)} &nbsp; "
-            f"({root.total_entries() - 1} entries)"
+            f"<b>{_set_label(s)}</b> &nbsp; — &nbsp; {_human(s.total_size)} &nbsp; "
+            f"({root.total_entries() - 1} entries{shards})"
         )
-        self._current_entry = entry
+        self._current_set = s
         self._set_file_tree(root)
-        self._pending_archive = None
-        # If the selection was driven by a search-result click, scroll the
-        # newly-loaded tree to that path now that the model is in place.
+        self._pending_group = None
         if self._pending_highlight_path is not None:
             self._scroll_to_path(self._pending_highlight_path)
             self._pending_highlight_path = None
 
-    def _on_sidecar_failed(self, archive_filename: str, msg: str) -> None:
-        if archive_filename != self._pending_archive:
+    def _on_sidecar_failed(self, group_id: str, msg: str) -> None:
+        if group_id != self._pending_group:
             return
-        sc = sidecar_mirror_path(self._plan.plan_name, archive_filename) if self._plan else "(?)"
-        QMessageBox.warning(self, "Could not read sidecar", f"{sc}\n\n{msg}")
+        QMessageBox.warning(self, "Could not read sidecar", f"{group_id}\n\n{msg}")
         self._set_file_tree(None)
-        self._pending_archive = None
+        self._pending_group = None
 
     # ---------- reindex / recover buttons ----------
 
-    def _show_no_sidecar(self, entry: ArchiveEntry) -> None:
-        """Render the no-sidecar state, swapping in the running/idle button
-        from whichever tracker applies.
-
-        Failed-status archives get a Recover button (not Reindex): their
-        archive file is at the .failed suffix on disk, so --reindex can't open
-        it — recovery renames it back, verifies the stream, and rebuilds the
-        index in one pass. Non-failed no-sidecar archives get the Reindex
-        button as before.
+    def _show_no_sidecar(self, s: manifestlib.ShardSet) -> None:
+        """Render the not-ready state for a logical backup, with the right
+        button. A failed set offers Recover (its failed shards are at .failed
+        on disk); an otherwise-ok set missing a sidecar offers Reindex. Both
+        act on whichever shards need it.
         """
         plan_name = self._plan.plan_name if self._plan else ""
-        recovering = (self._recover_tracker.running_for(plan_name, entry.filename)
-                      if self._recover_tracker else None)
-        reindexing = (self._tracker.running_for(plan_name, entry.filename)
-                      if self._tracker else None)
+        recovering = bool(self._recover_tracker) and any(
+            self._recover_tracker.running_for(plan_name, m.filename) for m in s.members)
+        reindexing = bool(self._tracker) and any(
+            self._tracker.running_for(plan_name, m.filename) for m in s.members)
+        label = _set_label(s)
 
-        if recovering is not None:
-            self._archive_label.setText(
-                f"<b>{entry.filename}</b> — backup failed (Recovering now)"
-            )
+        if recovering:
+            self._archive_label.setText(f"<b>{label}</b> — backup failed (Recovering now)")
             self._reindex_btn.setVisible(False)
             self._recover_btn.setVisible(False)
             return
-        if reindexing is not None:
-            self._archive_label.setText(
-                f"<b>{entry.filename}</b> — no sidecar index (Indexing now)"
-            )
+        if reindexing:
+            self._archive_label.setText(f"<b>{label}</b> — no sidecar index (Indexing now)")
             self._reindex_btn.setVisible(False)
             self._recover_btn.setVisible(False)
             return
-        if entry.status == "failed":
-            self._archive_label.setText(
-                f"<b>{entry.filename}</b> — backup failed; attempt recovery?"
-            )
+        if s.status == "failed":
+            self._archive_label.setText(f"<b>{label}</b> — backup failed; attempt recovery?")
             self._reindex_btn.setVisible(False)
             self._recover_btn.setVisible(self._recover_tracker is not None)
             return
-        self._archive_label.setText(
-            f"<b>{entry.filename}</b> — no sidecar index"
-        )
+        self._archive_label.setText(f"<b>{label}</b> — no sidecar index")
         self._recover_btn.setVisible(False)
         self._reindex_btn.setVisible(self._tracker is not None)
 
-    def _selected_archive_entry(self) -> ArchiveEntry | None:
+    def _selected_set(self) -> manifestlib.ShardSet | None:
         items = self._archive_list.selectedItems()
         if not items:
             return None
         data = items[0].data(0, Qt.ItemDataRole.UserRole)
-        return data if isinstance(data, ArchiveEntry) else None
+        return data if isinstance(data, manifestlib.ShardSet) else None
+
+    def _group_of(self, archive: str) -> str:
+        return manifestlib._group_id_from_filename(archive)
 
     def _on_reindex_clicked(self) -> None:
         if self._plan is None or self._tracker is None:
             return
-        entry = self._selected_archive_entry()
-        if entry is None or entry.has_sidecar:
+        s = self._selected_set()
+        if s is None:
             return
-        handle = self._tracker.start(self._plan.plan_name, entry.filename)
-        if handle is None:
-            QMessageBox.warning(
-                self, "Reindex failed to launch",
-                f"Could not start reindex for {entry.filename}.",
-            )
+        targets = [m for m in s.members if not m.has_sidecar]
+        if not targets:
             return
-        # Repaint immediately for the user who just clicked; the tracker's
-        # `started` signal will also fire and is idempotent for this archive.
-        self._show_no_sidecar(entry)
+        launched = any(self._tracker.start(self._plan.plan_name, m.filename) is not None
+                       for m in targets)
+        if not launched:
+            QMessageBox.warning(self, "Reindex failed to launch",
+                                f"Could not start reindex for {s.group_id}.")
+            return
+        self._show_no_sidecar(s)
 
     def _on_reindex_started(self, plan_name: str, archive: str) -> None:
         if self._plan is None or plan_name != self._plan.plan_name:
             return
-        entry = self._selected_archive_entry()
-        if entry is not None and entry.filename == archive and not entry.has_sidecar:
-            self._show_no_sidecar(entry)
+        s = self._selected_set()
+        if s is not None and any(m.filename == archive for m in s.members):
+            self._show_no_sidecar(s)
 
     def _on_reindex_finished(self, plan_name: str, archive: str,
                              ok: bool, log_tail: str) -> None:
@@ -399,43 +387,40 @@ class ArchivePanel(QWidget):
                 self, f"Reindex failed: {archive}",
                 f"{archive}\n\n{log_tail or '(no output captured)'}",
             )
-            # Restore the idle warning so the button reappears for retry.
-            entry = self._selected_archive_entry()
-            if entry is not None and entry.filename == archive and not entry.has_sidecar:
-                self._show_no_sidecar(entry)
+            s = self._selected_set()
+            if s is not None and any(m.filename == archive for m in s.members):
+                self._show_no_sidecar(s)
             return
-        # Success: --reindex flipped has_sidecar in the manifest mirror;
-        # reload the listing and re-select the archive so the file tree
-        # loads automatically.
-        was_selected = self._selected_archive_entry()
-        target = archive if (was_selected and was_selected.filename == archive) else None
+        # Success: --reindex flipped has_sidecar in the manifest mirror. Reload
+        # and re-select the set (if some shards are still reindexing, selection
+        # will just show "Indexing now" until they finish).
+        s = self._selected_set()
+        target = s.group_id if (s and any(m.filename == archive for m in s.members)) else None
         self.refresh()
         if target is not None:
-            self._select_archive(target)
+            self._select_set(target)
 
     def _on_recover_clicked(self) -> None:
         if self._plan is None or self._recover_tracker is None:
             return
-        entry = self._selected_archive_entry()
-        if entry is None or entry.status != "failed":
+        s = self._selected_set()
+        if s is None or s.status != "failed":
             return
-        handle = self._recover_tracker.start(self._plan.plan_name, entry.filename)
-        if handle is None:
-            QMessageBox.warning(
-                self, "Recovery failed to launch",
-                f"Could not start recovery for {entry.filename}.",
-            )
+        targets = [m for m in s.members if m.status == "failed"]
+        launched = any(self._recover_tracker.start(self._plan.plan_name, m.filename) is not None
+                       for m in targets)
+        if not launched:
+            QMessageBox.warning(self, "Recovery failed to launch",
+                                f"Could not start recovery for {s.group_id}.")
             return
-        # Repaint immediately for the user who just clicked; the tracker's
-        # `started` signal will also fire and is idempotent for this archive.
-        self._show_no_sidecar(entry)
+        self._show_no_sidecar(s)
 
     def _on_recover_started(self, plan_name: str, archive: str) -> None:
         if self._plan is None or plan_name != self._plan.plan_name:
             return
-        entry = self._selected_archive_entry()
-        if entry is not None and entry.filename == archive and entry.status == "failed":
-            self._show_no_sidecar(entry)
+        s = self._selected_set()
+        if s is not None and any(m.filename == archive for m in s.members):
+            self._show_no_sidecar(s)
 
     def _on_recover_finished(self, plan_name: str, archive: str,
                              ok: bool, log_tail: str) -> None:
@@ -447,29 +432,26 @@ class ArchivePanel(QWidget):
                 f"{archive} could not be recovered — its archive stream is "
                 f"likely truncated or corrupt.\n\n{log_tail or '(no output captured)'}",
             )
-            # Restore the failed state so the Recover button reappears for retry.
-            entry = self._selected_archive_entry()
-            if entry is not None and entry.filename == archive and not entry.has_sidecar:
-                self._show_no_sidecar(entry)
+            s = self._selected_set()
+            if s is not None and any(m.filename == archive for m in s.members):
+                self._show_no_sidecar(s)
             return
-        # Success: recovery flipped status->ok-with-warnings and has_sidecar in
-        # the manifest mirror; reload + re-select so the file tree loads.
-        was_selected = self._selected_archive_entry()
-        target = archive if (was_selected and was_selected.filename == archive) else None
+        s = self._selected_set()
+        target = s.group_id if (s and any(m.filename == archive for m in s.members)) else None
         self.refresh()
         if target is not None:
-            self._select_archive(target)
+            self._select_set(target)
 
-    def _select_archive(self, filename: str) -> None:
+    def _select_set(self, group_id: str) -> None:
         for i in range(self._archive_list.topLevelItemCount()):
             top = self._archive_list.topLevelItem(i)
             for j in range(top.childCount()):
                 child = top.child(j)
                 data = child.data(0, Qt.ItemDataRole.UserRole)
-                if isinstance(data, ArchiveEntry) and data.filename == filename:
-                    # Clearing _current_entry forces _on_archive_selection
-                    # to re-render rather than bailing on the same-entry guard.
-                    self._current_entry = None
+                if isinstance(data, manifestlib.ShardSet) and data.group_id == group_id:
+                    # Clearing _current_set forces _on_archive_selection to
+                    # re-render rather than bailing on the same-set guard.
+                    self._current_set = None
                     self._archive_list.setCurrentItem(child)
                     return
 
@@ -483,16 +465,17 @@ class ArchivePanel(QWidget):
         self._right_stack.setCurrentIndex(0)
 
     def _on_search_result_activated(self, archive: str, path: str) -> None:
-        # Stash the highlight target before triggering selection so that
-        # the async sidecar load can pick it up on completion.
+        # A search hit names one shard file; navigate to its logical backup
+        # (whose merged tree contains the path regardless of owning shard).
+        group = self._group_of(archive)
         self._pending_highlight_path = path
         self._exit_search_mode()
-        if self._current_entry is not None and self._current_entry.filename == archive:
+        if self._current_set is not None and self._current_set.group_id == group:
             # Tree already loaded — scroll now, no need to wait for async load.
             self._scroll_to_path(path)
             self._pending_highlight_path = None
             return
-        self._select_archive(archive)
+        self._select_set(group)
 
     def _scroll_to_path(self, path: str) -> None:
         """Locate `path` (e.g. './home/kim/recipe.md') in the loaded tree
@@ -566,7 +549,7 @@ class ArchivePanel(QWidget):
     def _update_selection_label(self) -> None:
         n = len(self._selected_member_paths())
         self._selection_label.setText(f"Selected: {n} path{'s' if n != 1 else ''}")
-        self._extract_btn.setEnabled(n > 0 and self._current_entry is not None)
+        self._extract_btn.setEnabled(n > 0 and self._current_set is not None)
 
     def _selected_member_paths(self) -> list[str]:
         if not self._tree_model:
@@ -583,17 +566,28 @@ class ArchivePanel(QWidget):
     # ---------- extract ----------
 
     def _on_extract(self) -> None:
-        if not self._current_entry or not self._tree_model or not self._plan:
+        if not self._current_set or not self._tree_model or not self._plan:
             return
         paths = self._selected_member_paths()
         if not paths:
             return
-        # Extraction is a deliberate, user-initiated mount touch.
-        archive_path = self._plan.archive_dir() / self._current_entry.filename
-        dlg = RestoreDialog(archive_path, paths, parent=self)
+        # Extraction is a deliberate, user-initiated mount touch. Restore from
+        # all shards of the logical backup; each holds a disjoint subset.
+        adir = self._plan.archive_dir()
+        archive_paths = [adir / m.filename for m in self._current_set.members]
+        dlg = RestoreDialog(archive_paths, paths, parent=self,
+                            label=_set_label(self._current_set))
         dlg.exec()
         # Selection might have been invalidated by user interaction; refresh.
         self._update_selection_label()
+
+
+def _set_label(s: manifestlib.ShardSet) -> str:
+    """Row/header label for a logical backup. Sharded backups show the
+    shard-group stem and a shard count; unsharded show the archive filename."""
+    if s.shard_count > 1:
+        return f"{s.kind}  {s.group_id}  ({s.shard_count} shards)"
+    return f"{s.kind}  {s.members[0].filename}"
 
 
 def _human(n: int) -> str:

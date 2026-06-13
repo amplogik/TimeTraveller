@@ -256,6 +256,30 @@ def load_sidecar_tree(sidecar_path: Path) -> IndexNode:
     return parse_index(out)
 
 
+def _merge_node(dst: IndexNode, src: IndexNode) -> None:
+    for name, child in src.children.items():
+        existing = dst.children.get(name)
+        if existing is None:
+            dst.children[name] = child            # adopt subtree wholesale
+        elif existing.is_dir and child.is_dir:
+            _merge_node(existing, child)           # union directory contents
+        # Files are disjoint across shards (a member lives in exactly one
+        # shard), so a same-named file collision can't legitimately occur;
+        # keep the first if it ever does.
+
+
+def merge_sidecar_trees(roots: list[IndexNode]) -> IndexNode:
+    """Merge the per-shard sidecar trees of one logical backup into a single
+    tree (the union of files). Used to present a sharded backup as one file
+    tree. Single-element input is returned as-is."""
+    if len(roots) == 1:
+        return roots[0]
+    merged = IndexNode(name="", full_path="", is_dir=True)
+    for r in roots:
+        _merge_node(merged, r)
+    return merged
+
+
 # ---------- archive enumeration ----------
 
 @dataclass

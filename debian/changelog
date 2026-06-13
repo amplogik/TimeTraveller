@@ -1,3 +1,16 @@
+timetraveller (1.1.1) unstable; urgency=medium
+
+  * GUI: a sharded backup now shows as ONE logical-backup row ("full
+    2026-06-13_full (4 shards)") instead of one row per shard. Selecting it
+    loads a single merged file tree spanning all shards, so browsing and
+    restore work on the whole backup transparently. Extract dispatches across
+    the set's shards (each holds a disjoint subset). Reindex/Recover act on the
+    specific shards that need it. Unsharded backups are unchanged.
+  * manifest.group_into_sets() / archive.merge_sidecar_trees() back the GUI
+    collapse; file search still indexes every shard.
+
+ -- Kim McCann <amplogik@gmail.com>  Sat, 13 Jun 2026 11:02:47 -0700
+
 timetraveller (1.1.0) unstable; urgency=medium
 
   * Sharding: a backup can now be written as N parallel pax|zstd streams to N

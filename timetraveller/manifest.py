@@ -155,17 +155,22 @@ class ShardSet:
             m.status in ("ok", "ok-with-warnings") for m in self.members)
 
 
-def shard_sets(manifest: Manifest) -> list[ShardSet]:
-    """Group a manifest's entries into shard sets (one logical backup each),
-    sorted oldest-first by start time. Members within a set are sorted by
+def group_into_sets(entries: list[ArchiveEntry]) -> list[ShardSet]:
+    """Group a flat list of entries into shard sets (one logical backup each),
+    sorted oldest-first by start time; members within a set sorted by
     shard_index."""
     groups: dict[str, list[ArchiveEntry]] = {}
-    for a in manifest.archives:
+    for a in entries:
         groups.setdefault(group_id_for(a), []).append(a)
     sets = [ShardSet(group_id=gid, members=sorted(ms, key=lambda m: m.shard_index))
             for gid, ms in groups.items()]
     sets.sort(key=lambda s: s.date_started)
     return sets
+
+
+def shard_sets(manifest: Manifest) -> list[ShardSet]:
+    """Shard sets for an entire manifest. See group_into_sets."""
+    return group_into_sets(manifest.archives)
 
 
 @dataclass

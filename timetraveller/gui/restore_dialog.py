@@ -22,24 +22,43 @@ from ..extract import ExtractStats, extract_files
 
 
 class _ExtractWorker(QObject):
-    """Runs extract_files() off the Qt thread; emits results via signals."""
+    """Runs extract_files() off the Qt thread; emits results via signals.
 
-    finished = pyqtSignal(object)   # ExtractStats
+    Extracts from one or more shard archives (the shards of one logical
+    backup) and sums the stats — each requested member lives in exactly one
+    shard, so a shard that holds none of them simply contributes nothing.
+    """
+
+    finished = pyqtSignal(object)   # aggregated ExtractStats
     failed = pyqtSignal(str)
 
-    def __init__(self, archive: Path, paths: list[str], into: Path):
+    def __init__(self, archives: list[Path], paths: list[str], into: Path):
         super().__init__()
-        self._archive = archive
+        self._archives = archives
         self._paths = paths
         self._into = into
 
     def run(self) -> None:
         try:
-            stats = extract_files(self._archive, self._paths, into=self._into)
+            agg = ExtractStats(requested_patterns=len(self._paths), matched_files=0,
+                               matched_dirs=0, matched_symlinks=0, matched_hardlinks=0,
+                               frames_read=0, nfs_bytes_read=0, bytes_written=0,
+                               seconds_total=0.0, fallback_naive=False)
+            for archive in self._archives:
+                st = extract_files(archive, self._paths, into=self._into)
+                agg.matched_files += st.matched_files
+                agg.matched_dirs += st.matched_dirs
+                agg.matched_symlinks += st.matched_symlinks
+                agg.matched_hardlinks += st.matched_hardlinks
+                agg.frames_read += st.frames_read
+                agg.nfs_bytes_read += st.nfs_bytes_read
+                agg.bytes_written += st.bytes_written
+                agg.seconds_total += st.seconds_total
+                agg.fallback_naive = agg.fallback_naive or st.fallback_naive
         except Exception as exc:  # noqa: BLE001 - surface every failure to the UI
             self.failed.emit(f"{type(exc).__name__}: {exc}")
             return
-        self.finished.emit(stats)
+        self.finished.emit(agg)
 
 
 def _hms(seconds: float) -> str:
@@ -63,14 +82,16 @@ def _human_bytes(n: int) -> str:
 
 
 class RestoreDialog(QDialog):
-    """Extract specific paths from a single archive into a chosen destination."""
+    """Extract specific paths from a backup (one or more shard archives) into a
+    chosen destination."""
 
-    def __init__(self, archive: Path, paths: list[str], parent=None):
+    def __init__(self, archives, paths: list[str], parent=None, *, label: str = ""):
         super().__init__(parent)
-        self.setWindowTitle("Extract from archive")
+        self.setWindowTitle("Extract from backup")
         self.resize(900, 600)
 
-        self._archive = archive
+        # Accept a single Path (legacy) or a list of shard archive paths.
+        self._archives = [archives] if isinstance(archives, Path) else list(archives)
         self._paths = paths
         self._thread: QThread | None = None
         self._worker: _ExtractWorker | None = None
@@ -78,7 +99,9 @@ class RestoreDialog(QDialog):
         layout = QVBoxLayout(self)
 
         info = QFormLayout()
-        info.addRow("Archive:", QLabel(str(archive)))
+        shown = label or (str(self._archives[0]) if len(self._archives) == 1
+                          else f"{len(self._archives)} shards")
+        info.addRow("Backup:", QLabel(shown))
         info.addRow("Paths:", QLabel(f"{len(paths)} selected"))
         layout.addLayout(info)
 
@@ -90,7 +113,8 @@ class RestoreDialog(QDialog):
 
         dest_row = QHBoxLayout()
         dest_row.addWidget(QLabel("Destination:"))
-        default_dest = str(Path.home() / "Restored" / archive.stem.split(".")[0])
+        default_dest = str(Path.home() / "Restored"
+                           / self._archives[0].stem.split(".")[0])
         self._dest = QLineEdit(default_dest)
         dest_row.addWidget(self._dest, 1)
         browse = QPushButton("Browse…")
@@ -150,7 +174,7 @@ class RestoreDialog(QDialog):
 
         # Move the work to a worker thread so the Qt event loop keeps spinning.
         self._thread = QThread(self)
-        self._worker = _ExtractWorker(self._archive, list(self._paths), dest)
+        self._worker = _ExtractWorker(list(self._archives), list(self._paths), dest)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.finished.connect(self._on_finished)
