@@ -88,6 +88,14 @@ def build_parser() -> argparse.ArgumentParser:
                               "falls back to whole-archive scan otherwise.")
     actions.add_argument("--prune", action="store_true",
                          help="Apply retention without taking a new backup.")
+    actions.add_argument("--delete-cycle", metavar="CYCLE_ID", default=None,
+                         help="Delete one whole cycle (full + incrementals, all "
+                              "shards) by cycle_id. Refuses the newest complete "
+                              "cycle unless --force.")
+    actions.add_argument("--delete-set", metavar="GROUP_ID", default=None,
+                         help="Delete one logical backup (its shard set) by "
+                              "group_id. Refuses an incremental-bearing full or "
+                              "the newest complete full unless --force.")
     actions.add_argument("--remove-plan", action="store_true",
                          help="Uninstall the plan's schedule, delete its config file, "
                               "and clear its local mirror state. By default, archive "
@@ -871,28 +879,145 @@ def action_prune(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
     return 0
 
 
+def _newest_complete_cycle_id(m: manifestlib.Manifest) -> str | None:
+    """cycle_id of the newest complete cycle, or None. Mirrors retention.apply's
+    always-keep guard (sort complete cycles by id, take the last) so interactive
+    deletes refuse the same cycle automatic pruning will never remove."""
+    complete = sorted((c for c in manifestlib.cycles(m) if c.is_complete),
+                      key=lambda c: c.cycle_id)
+    return complete[-1].cycle_id if complete else None
+
+
+def _load_plan_manifest(plan: configlib.PlanConfig):
+    """(archive_dir, manifest) for a plan, with plan_name backfilled. Matches the
+    inline pattern in action_prune/action_reindex."""
+    archive_dir = plan.archive_dir()
+    m = manifestlib.load(manifestlib.manifest_path(archive_dir))
+    if not m.plan_name:
+        m.plan_name = plan.plan_name
+    return archive_dir, m
+
+
+def action_delete_cycle(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
+    """Delete one whole cycle (full + incrementals, every shard) by cycle_id.
+
+    Refuses the newest complete cycle unless --force, mirroring retention's
+    always-keep guard. The GUI passes --force after its type-to-confirm + blast-
+    radius disclosure; the bare guard protects ad-hoc CLI/script use.
+    """
+    cid = args.delete_cycle
+    archive_dir, m = _load_plan_manifest(plan)
+    target = next((c for c in manifestlib.cycles(m) if c.cycle_id == cid), None)
+    if target is None:
+        print(f"delete-cycle: no cycle {cid!r} in plan {plan.plan_name!r}",
+              file=sys.stderr)
+        return 1
+    if not args.force and _newest_complete_cycle_id(m) == cid:
+        print(f"delete-cycle: {cid} is the newest complete cycle; refusing "
+              f"(use --force to override).", file=sys.stderr)
+        return 1
+    sets = ([target.full_set] if target.full_set else []) + target.incr_sets
+    n = _delete_sets(archive_dir, plan.plan_name, sets, m,
+                     log=lambda msg: _log(args, msg))
+    _log(args, f"delete-cycle {cid}: removed {n} shard archive(s).")
+    return 0
+
+
+def action_delete_set(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
+    """Delete one logical backup (a shard set) by its group_id.
+
+    Refuses, unless --force: a full set with dependent incrementals (deleting it
+    orphans them), or the newest complete cycle's full. Mid-chain incrementals
+    are not blocked here — the GUI discloses dependents and passes --force.
+    """
+    gid = args.delete_set
+    archive_dir, m = _load_plan_manifest(plan)
+    target = next((s for s in manifestlib.shard_sets(m) if s.group_id == gid), None)
+    if target is None:
+        print(f"delete-set: no backup {gid!r} in plan {plan.plan_name!r}",
+              file=sys.stderr)
+        return 1
+    if not args.force:
+        for c in manifestlib.cycles(m):
+            if c.full_set and c.full_set.group_id == gid:
+                if c.incr_sets:
+                    print(f"delete-set: {gid} is a full with {len(c.incr_sets)} "
+                          f"dependent incremental backup(s); refusing "
+                          f"(use --force).", file=sys.stderr)
+                    return 1
+                if _newest_complete_cycle_id(m) == c.cycle_id:
+                    print(f"delete-set: {gid} is the newest complete cycle's "
+                          f"full; refusing (use --force).", file=sys.stderr)
+                    return 1
+                break
+    n = _delete_sets(archive_dir, plan.plan_name, [target], m,
+                     log=lambda msg: _log(args, msg))
+    _log(args, f"delete-set {gid}: removed {n} shard archive(s).")
+    return 0
+
+
+def _delete_entry_files(archive_dir: Path, plan_name: str,
+                        entry: manifestlib.ArchiveEntry, log) -> None:
+    """Remove every on-disk file belonging to one shard entry, plus its local
+    sidecar mirror. The manifest is the caller's responsibility.
+
+    Sweeps by filename prefix so a single pass catches the archive, its sidecars
+    (`.idx.zst`, `.frames.json`, `.frames.json.partial`) AND the `.failed`-suffixed
+    variant a failed shard leaves on disk (the manifest keeps the bare name; the
+    file is suffixed). The `.pax.zst` suffix is fixed and shard indices live before
+    it, so the prefix can't collide with a sibling archive."""
+    prefix = entry.filename
+    try:
+        victims = sorted(p for p in archive_dir.iterdir()
+                         if p.name == prefix or p.name.startswith(prefix + "."))
+    except FileNotFoundError:
+        victims = []
+    for p in victims:
+        try:
+            log(f"rm {p}")
+            p.unlink()
+        except FileNotFoundError:
+            pass
+    indexlib.delete_sidecar_mirror(plan_name, entry.filename)
+
+
+def _delete_sets(archive_dir: Path, plan_name: str, sets: list,
+                 manifest: manifestlib.Manifest, log=None) -> int:
+    """Delete the shard archives of the given ShardSets — every member's files
+    (archive, `.failed`, sidecars, frames, mirror) — and drop them from the
+    manifest. Saves the manifest iff anything was removed. Returns the count of
+    shard entries removed."""
+    log = log or (lambda _msg: None)
+    removed = 0
+    for s in sets:
+        for a in s.members:
+            _delete_entry_files(archive_dir, plan_name, a, log)
+            manifest.remove(a.filename)
+            removed += 1
+    if removed:
+        _save_manifest(manifest, archive_dir, plan_name)
+    return removed
+
+
 def _delete_cycles(archive_dir: Path, plan_name: str,
                    cycles_to_delete: list, manifest: manifestlib.Manifest,
                    log=None) -> None:
-    """Delete the given cycles' archive files + sidecars and update the manifest.
+    """Delete the given cycles' shard archives + sidecars and update the manifest.
 
-    Shared by action_prune and prune_to_newest_cycle. Saves the manifest only
-    if at least one cycle was deleted.
+    Shared by action_prune and prune_to_newest_cycle. Delegates to _delete_sets
+    (one logical backup at a time), which also clears `.failed`/`.frames.json`
+    that the older per-(archive,idx) removal missed.
     """
     if not cycles_to_delete:
         return
     log = log or (lambda _msg: None)
+    sets: list = []
     for cycle in cycles_to_delete:
-        for a in cycle.archives:
-            apath = archive_dir / a.filename
-            spath = indexlib.sidecar_path(apath)
-            for p in (apath, spath):
-                if p.exists():
-                    log(f"prune: rm {p}")
-                    p.unlink()
-            indexlib.delete_sidecar_mirror(plan_name, a.filename)
-            manifest.remove(a.filename)
-    _save_manifest(manifest, archive_dir, plan_name)
+        if cycle.full_set:
+            sets.append(cycle.full_set)
+        sets.extend(cycle.incr_sets)
+    _delete_sets(archive_dir, plan_name, sets, manifest,
+                 log=lambda msg: log(f"prune: {msg}"))
 
 
 def _config_path_for_args(args: argparse.Namespace) -> Path:
@@ -1530,6 +1655,10 @@ def main(argv: list[str] | None = None) -> int:
         return action_extract(args, plan)
     if args.prune:
         return action_prune(args, plan)
+    if args.delete_cycle:
+        return action_delete_cycle(args, plan)
+    if args.delete_set:
+        return action_delete_set(args, plan)
     if args.remove_plan:
         return action_remove_plan(args, plan)
     if args.switch_to_archive:
