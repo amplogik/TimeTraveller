@@ -11,14 +11,23 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from timetraveller.pax import RunResult
 
 
-def _result(pax_rc: int, zstd_rc: int) -> RunResult:
+def _result(pax_rc: int, zstd_rc: int, pax_stderr: str | None = None) -> RunResult:
     return RunResult(
         pax_returncode=pax_rc,
         zstd_returncode=zstd_rc,
+        pax_stderr=pax_stderr,
         archive_path=Path("/tmp/unused.pax.zst"),
         archive_size=0,
         duration_seconds=0.0,
     )
+
+
+# The real failing run, verbatim from ~/.local/state/timetraveller/home.log.
+_BRAVE_RACE_STDERR = """\
+tar: ./home/kim/.config/BraveSoftware/Brave-Browser/Safe Browsing/UrlBilling.store.4_13425813062472980: Cannot stat: No such file or directory
+tar: ./home/kim/.config/BraveSoftware/Brave-Browser/Safe Browsing/UrlMalBin.store.4_13425813062473064: Cannot stat: No such file or directory
+tar: Exiting with failure status due to previous errors
+"""
 
 
 def test_pax_zero_zstd_zero_is_ok():
@@ -35,9 +44,58 @@ def test_pax_one_zstd_zero_is_warnings():
     assert r.ok is True
 
 
-def test_pax_two_zstd_zero_is_failed():
-    """pax exit >=2 is a fatal walk error — archive may be incomplete."""
+def test_pax_two_zstd_zero_no_stderr_is_failed():
+    """pax exit >=2 with no captured stderr stays failed — we can't certify the
+    archive without seeing why pax bailed."""
     r = _result(2, 0)
+    assert r.status == "failed"
+    assert r.ok is False
+
+
+def test_pax_two_empty_stderr_is_failed():
+    """Exit >=2 but no diagnostics we recognise: don't trust it."""
+    r = _result(2, 0, pax_stderr="")
+    assert r.status == "failed"
+    assert r.ok is False
+
+
+def test_pax_two_vanished_files_is_warnings():
+    """Exit 2 caused only by files vanishing mid-walk (ENOENT) is the same
+    benign race as exit 1 — the stream is valid, missing members are skipped."""
+    r = _result(2, 0, pax_stderr=_BRAVE_RACE_STDERR)
+    assert r.status == "ok-with-warnings"
+    assert r.ok is True
+
+
+def test_pax_two_cannot_open_enoent_is_warnings():
+    """The open-phase wording for a vanished file is equally benign."""
+    stderr = ("tar: ./home/kim/cache/x: Cannot open: No such file or directory\n"
+              "tar: Exiting with failure status due to previous errors\n")
+    r = _result(2, 0, pax_stderr=stderr)
+    assert r.status == "ok-with-warnings"
+
+
+def test_pax_two_enospc_is_failed():
+    """A genuine fatal line among the vanished-file lines keeps it failed."""
+    stderr = ("tar: ./home/kim/x: Cannot stat: No such file or directory\n"
+              "tar: /mnt/Backups/a.pax.zst: Cannot write: No space left on device\n"
+              "tar: Error is not recoverable: exiting now\n")
+    r = _result(2, 0, pax_stderr=stderr)
+    assert r.status == "failed"
+    assert r.ok is False
+
+
+def test_pax_two_permission_denied_is_failed():
+    """Permission denied is not the vanished-file race; stay failed."""
+    stderr = ("tar: ./home/kim/.ssh/id_ed25519: Cannot open: Permission denied\n"
+              "tar: Exiting with failure status due to previous errors\n")
+    r = _result(2, 0, pax_stderr=stderr)
+    assert r.status == "failed"
+
+
+def test_pax_two_benign_stderr_but_zstd_failed_is_failed():
+    """A zstd failure dominates even when tar's stderr is all-benign."""
+    r = _result(2, 7, pax_stderr=_BRAVE_RACE_STDERR)
     assert r.status == "failed"
     assert r.ok is False
 

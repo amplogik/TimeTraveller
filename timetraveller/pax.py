@@ -294,6 +294,98 @@ def any_changes_in_window(sources, excludes_re, extra_excludes, frm, to,
     ))
 
 
+# A benign per-file race: tar/pax could not stat or open a listed path because
+# it disappeared (ENOENT) between enumeration and the read pass. Volatile trees
+# (browser caches, Brave's "Safe Browsing/*.store") rotate constantly, so this
+# happens routinely on a busy home dir. The missing member is simply skipped;
+# the archive stream stays structurally valid.
+_BENIGN_FILE_ENOENT = re.compile(
+    r":\s*Cannot (?:stat|open):\s*No such file or directory\s*$"
+)
+
+# tar's generic trailer, printed once when any per-file error occurred. Benign
+# on its own — it only summarises the per-file diagnostics above it.
+_BENIGN_SUMMARY = re.compile(
+    r"Exiting with failure status due to previous errors\s*$"
+)
+
+# Log framing we write ourselves (see run/run_with_file_list); never a tar diag.
+_NON_DIAGNOSTIC_PREFIXES = ("CMD:", "CWD:", "OUT:", "FILES:", "---")
+
+# Cap on captured stderr kept in memory for classification. Real runs emit a
+# handful of lines; even thousands of vanished files stay well under this. If a
+# run blows past it we can't certify benignity, so we fall back to "failed".
+_PAX_STDERR_CAP = 1 << 20  # 1 MiB
+
+
+def _stderr_is_only_benign(stderr_text: str) -> bool:
+    """True if every tar/pax diagnostic in `stderr_text` is a benign ENOENT
+    file-race line (or the generic failure-summary trailer).
+
+    A single unrecognised diagnostic — ENOSPC, permission denied, a zstd error,
+    a truncated-stream complaint — makes this return False.
+    """
+    saw_diag = False
+    for line in stderr_text.splitlines():
+        s = line.strip()
+        if not s or s.startswith(_NON_DIAGNOSTIC_PREFIXES):
+            continue
+        saw_diag = True
+        if not (s.startswith("tar:")
+                and (_BENIGN_FILE_ENOENT.search(s) or _BENIGN_SUMMARY.search(s))):
+            return False
+    # Exit was >=2, so there must be *some* diagnostic explaining it; if we
+    # captured none we recognise, don't certify the archive as trustworthy.
+    return saw_diag
+
+
+class _StderrCapture:
+    """Pump a subprocess's stderr in a background thread: tee every byte to the
+    run log and keep a bounded copy for status classification.
+
+    A thread (not a post-hoc read) is required because pax's stdout is being
+    drained concurrently — leaving stderr unread risks filling its pipe buffer
+    and deadlocking pax mid-run.
+    """
+
+    def __init__(self, log_fp) -> None:
+        self._log_fp = log_fp
+        self._buf = bytearray()
+        self._truncated = False
+        self._thread: threading.Thread | None = None
+        self._pipe = None
+
+    def start(self, pipe) -> None:
+        self._pipe = pipe
+        self._thread = threading.Thread(target=self._pump, daemon=False)
+        self._thread.start()
+
+    def _pump(self) -> None:
+        try:
+            for chunk in iter(lambda: self._pipe.read(65536), b""):
+                if self._log_fp:
+                    self._log_fp.write(chunk)
+                    self._log_fp.flush()
+                room = _PAX_STDERR_CAP - len(self._buf)
+                if room > 0:
+                    self._buf.extend(chunk[:room])
+                if len(chunk) > room:
+                    self._truncated = True
+        finally:
+            self._pipe.close()
+
+    def join(self) -> None:
+        if self._thread:
+            self._thread.join()
+
+    @property
+    def text(self) -> str | None:
+        """Captured stderr, or None if it overflowed the cap (uncertifiable)."""
+        if self._truncated:
+            return None
+        return self._buf.decode("utf-8", errors="replace")
+
+
 @dataclass
 class RunResult:
     pax_returncode: int
@@ -303,6 +395,7 @@ class RunResult:
     duration_seconds: float
     file_count: int = 0   # only meaningful for run_with_file_list
     frame_count: int = 0  # only meaningful when framed=True; 0 means unframed
+    pax_stderr: str | None = None  # captured tar/pax stderr; None if uncaptured
 
     @property
     def status(self) -> str:
@@ -310,14 +403,26 @@ class RunResult:
 
         pax exit 1 is POSIX-specified as a non-fatal warning (e.g. "file
         changed as we read it") — the stream is structurally valid, so the
-        archive is trustworthy. Only exit >=2 (fatal) or a zstd failure
-        means the archive itself cannot be trusted.
+        archive is trustworthy.
+
+        GNU tar reports a file that *vanished* between enumeration and the read
+        pass ("Cannot stat: No such file or directory") as exit 2, even though
+        it skips the member and the stream stays valid — semantically the same
+        benign race as exit 1. So an exit >=2 whose stderr contains *only* such
+        ENOENT lines is also downgraded to "ok-with-warnings". Any other fatal
+        diagnostic, a zstd failure, or stderr we couldn't capture keeps it
+        "failed".
         """
-        if self.zstd_returncode != 0 or self.pax_returncode >= 2:
+        if self.zstd_returncode != 0:
             return "failed"
+        if self.pax_returncode == 0:
+            return "ok"
         if self.pax_returncode == 1:
             return "ok-with-warnings"
-        return "ok"
+        # pax_returncode >= 2: trust only a benign ENOENT-only stderr.
+        if self.pax_stderr and _stderr_is_only_benign(self.pax_stderr):
+            return "ok-with-warnings"
+        return "failed"
 
     @property
     def ok(self) -> bool:
@@ -346,9 +451,11 @@ def run(invocation: PaxInvocation, *, log_file: Path | None = None) -> RunResult
             invocation.pax_argv(),
             cwd=invocation.chdir,
             stdout=subprocess.PIPE,
-            stderr=log_fp or subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
-        assert pax.stdout is not None
+        assert pax.stdout is not None and pax.stderr is not None
+        capture = _StderrCapture(log_fp)
+        capture.start(pax.stderr)
         zstd = subprocess.Popen(
             invocation.zstd_argv(),
             stdin=pax.stdout,
@@ -357,6 +464,7 @@ def run(invocation: PaxInvocation, *, log_file: Path | None = None) -> RunResult
         pax.stdout.close()  # SIGPIPE to pax if zstd dies
         zstd_rc = zstd.wait()
         pax_rc = pax.wait()
+        capture.join()
     finally:
         if log_fp:
             log_fp.close()
@@ -366,6 +474,7 @@ def run(invocation: PaxInvocation, *, log_file: Path | None = None) -> RunResult
     return RunResult(
         pax_returncode=pax_rc,
         zstd_returncode=zstd_rc,
+        pax_stderr=capture.text,
         archive_path=invocation.archive_path,
         archive_size=size,
         duration_seconds=duration,
@@ -407,9 +516,11 @@ def run_with_file_list(invocation: PaxInvocation, file_iter,
             cwd=invocation.chdir,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=log_fp or subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
-        assert pax.stdin is not None and pax.stdout is not None
+        assert pax.stdin is not None and pax.stdout is not None and pax.stderr is not None
+        capture = _StderrCapture(log_fp)
+        capture.start(pax.stderr)
 
         frame_box: dict = {}
         ft: threading.Thread | None = None
@@ -450,6 +561,7 @@ def run_with_file_list(invocation: PaxInvocation, file_iter,
         if ft is not None:
             ft.join()
             pax_rc = pax.wait()
+            capture.join()
             if "error" in frame_box:
                 raise frame_box["error"]
             frame_count = frame_box["result"]["frame_count"]
@@ -458,6 +570,7 @@ def run_with_file_list(invocation: PaxInvocation, file_iter,
             assert zstd is not None
             zstd_rc = zstd.wait()
             pax_rc = pax.wait()
+            capture.join()
             frame_count = 0
     finally:
         if log_fp:
@@ -471,6 +584,7 @@ def run_with_file_list(invocation: PaxInvocation, file_iter,
     return RunResult(
         pax_returncode=pax_rc,
         zstd_returncode=zstd_rc,
+        pax_stderr=capture.text,
         archive_path=invocation.archive_path,
         archive_size=size,
         duration_seconds=duration,
