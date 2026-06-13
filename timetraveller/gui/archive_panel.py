@@ -15,9 +15,9 @@ from pathlib import Path
 
 from PyQt6.QtCore import QModelIndex, QObject, Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QHBoxLayout, QHeaderView, QLabel, QMessageBox,
-    QPushButton, QSplitter, QStackedWidget, QTreeView, QTreeWidget,
-    QTreeWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QDialog, QHBoxLayout, QHeaderView, QLabel, QMenu,
+    QMessageBox, QPushButton, QSplitter, QStackedWidget, QTreeView,
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .. import manifest as manifestlib
@@ -29,6 +29,7 @@ from ..config import PlanConfig
 from ..index import sidecar_mirror_path
 from ..manifest import ArchiveEntry
 from .archive_tree_model import ArchiveTreeModel
+from .delete_dialog import DeleteConfirmDialog, cycle_token, set_token
 from .reindex_tracker import RecoverTracker, ReindexTracker
 from .restore_dialog import RestoreDialog
 from .search_widget import SearchWidget
@@ -65,6 +66,9 @@ class ArchivePanel(QWidget):
     """Browse and restore from archives belonging to a plan."""
 
     restore_requested = pyqtSignal()  # emitted after a successful extract
+    # (dialog title, worker action args) — main_window injects --plan/--config,
+    # spawns the worker off-thread, and refreshes. Used for delete actions.
+    worker_requested = pyqtSignal(str, list)
 
     def __init__(self, parent=None, *, tracker: ReindexTracker | None = None,
                  recover_tracker: RecoverTracker | None = None):
@@ -93,6 +97,9 @@ class ArchivePanel(QWidget):
         self._archive_list.setRootIsDecorated(True)
         self._archive_list.setMinimumWidth(360)
         self._archive_list.itemSelectionChanged.connect(self._on_archive_selection)
+        self._archive_list.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self._archive_list.customContextMenuRequested.connect(self._on_context_menu)
         splitter.addWidget(self._archive_list)
 
         # Right: a stack with two pages —
@@ -210,6 +217,7 @@ class ArchivePanel(QWidget):
     def _add_cycle(self, cycle: CycleListing) -> None:
         status = "complete" if cycle.is_complete else "INCOMPLETE"
         top = QTreeWidgetItem([f"Cycle {cycle.cycle_id}", "", status])
+        top.setData(0, Qt.ItemDataRole.UserRole, cycle)  # for the context menu
         if not cycle.is_complete:
             top.setForeground(0, _color("#cc8000"))
         self._archive_list.addTopLevelItem(top)
@@ -353,6 +361,94 @@ class ArchivePanel(QWidget):
 
     def _group_of(self, archive: str) -> str:
         return manifestlib._group_id_from_filename(archive)
+
+    # ---------- context menu (delete / reindex / recover) ----------
+
+    def _on_context_menu(self, pos) -> None:
+        """Right-click a cycle node → Delete cycle; a shard-set row → Delete
+        backup (plus Reindex/Recover when applicable, rehomed here from the
+        contextual buttons for discoverability)."""
+        if self._plan is None:
+            return
+        item = self._archive_list.itemAt(pos)
+        if item is None:
+            return
+        self._archive_list.setCurrentItem(item)  # so _selected_set() resolves
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        menu = QMenu(self)
+        if isinstance(data, manifestlib.ShardSet):
+            s = data
+            if s.status == "failed" and self._recover_tracker is not None:
+                menu.addAction("Recover failed backup", self._on_recover_clicked)
+            elif (not all(m.has_sidecar for m in s.members)
+                  and self._tracker is not None):
+                menu.addAction("Reindex (rebuild sidecar)", self._on_reindex_clicked)
+            if not menu.isEmpty():
+                menu.addSeparator()
+            menu.addAction("Delete backup…", lambda: self._delete_set(s))
+        elif isinstance(data, CycleListing):
+            menu.addAction("Delete cycle…", lambda: self._delete_cycle(data))
+        else:
+            return
+        menu.exec(self._archive_list.viewport().mapToGlobal(pos))
+
+    def _listing(self):
+        """Current archive listing from the local mirror (no mount access)."""
+        return list_from_manifest(self._plan.plan_name, self._plan.archive_dir())
+
+    def _newest_complete_cycle_id(self) -> str | None:
+        complete = sorted(c.cycle_id for c in self._listing().cycles
+                          if c.is_complete)
+        return complete[-1] if complete else None
+
+    def _set_dependency_info(self, s: manifestlib.ShardSet) -> tuple[int, bool]:
+        """(dependent-incremental count, is-newest-complete-full) for a set,
+        derived from the mirror — mirrors the worker's --force guards so the
+        dialog discloses exactly what the worker would otherwise refuse."""
+        newest_id = self._newest_complete_cycle_id()
+        for c in self._listing().cycles:
+            if c.full is not None and manifestlib.group_id_for(c.full) == s.group_id:
+                deps = len(manifestlib.group_into_sets(c.incrementals))
+                return deps, c.cycle_id == newest_id
+        return 0, False
+
+    def _delete_set(self, s: manifestlib.ShardSet) -> None:
+        if self._plan is None:
+            return
+        dependents, newest = self._set_dependency_info(s)
+        shards = f" ({s.shard_count} shards)" if s.shard_count > 1 else ""
+        dlg = DeleteConfirmDialog(
+            title="Delete backup",
+            summary=f"Delete the <b>{s.kind}</b> backup "
+                    f"<code>{s.group_id}</code>{shards}?",
+            token=set_token(self._plan.plan_name, s.kind, s.date_started),
+            files=[m.filename for m in s.members], total_bytes=s.total_size,
+            dependents=dependents, newest_complete=newest, parent=self,
+        )
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.worker_requested.emit(
+                f"Delete backup {s.group_id}",
+                ["--delete-set", s.group_id, "--force"])
+
+    def _delete_cycle(self, cycle: CycleListing) -> None:
+        if self._plan is None:
+            return
+        files = [a.filename for a in cycle.archives]
+        n_sets = len(manifestlib.group_into_sets(cycle.archives))
+        newest = (cycle.is_complete
+                  and cycle.cycle_id == self._newest_complete_cycle_id())
+        dlg = DeleteConfirmDialog(
+            title="Delete cycle",
+            summary=f"Delete <b>cycle {cycle.cycle_id}</b> "
+                    f"({n_sets} backup(s), {len(files)} shard archive(s))?",
+            token=cycle_token(self._plan.plan_name, cycle.cycle_id),
+            files=files, total_bytes=cycle.total_size,
+            dependents=0, newest_complete=newest, parent=self,
+        )
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.worker_requested.emit(
+                f"Delete cycle {cycle.cycle_id}",
+                ["--delete-cycle", cycle.cycle_id, "--force"])
 
     def _on_reindex_clicked(self) -> None:
         if self._plan is None or self._tracker is None:

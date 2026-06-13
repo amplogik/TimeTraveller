@@ -148,6 +148,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self._tabs)
         splitter.setStretchFactor(1, 1)
 
+        self._archive_panel.worker_requested.connect(self._on_archive_worker_requested)
         self._plan_panel.changed.connect(self._mark_dirty)
         self._plan_panel.switch_type_requested.connect(self._on_switch_type_request)
         self._schedule_panel.changed.connect(self._mark_dirty)
@@ -305,6 +306,18 @@ class MainWindow(QMainWindow):
             "--kind", kind, "--manual",
         ]
         self._spawn_worker(f"Run {kind} now", args)
+
+    def _on_archive_worker_requested(self, title: str, action_args: list) -> None:
+        """Run a delete (or other scoped) worker action the Archives panel asked
+        for, injecting --plan/--config from the active plan."""
+        if not self._current_plan_name:
+            return
+        args = [
+            "--plan", self._current_plan_name,
+            "--config", str(self._config_path_for(self._current_plan_name)),
+            *action_args,
+        ]
+        self._spawn_worker(title, args)
 
     def _spawn_worker(self, title: str, args: list[str]) -> None:
         dlg = WorkerRunDialog(title, args, parent=self)

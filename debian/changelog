@@ -1,3 +1,24 @@
+timetraveller (1.2.0) unstable; urgency=medium
+
+  * Archive management: delete a backup or a whole cycle from the GUI. Right-
+    click a cycle node ("Delete cycle…") or a backup row ("Delete backup…") in
+    the Archives tree. Reindex/Recover are now also offered in that context menu
+    (in addition to the existing buttons) so they're discoverable without first
+    selecting a failed/sidecar-less backup.
+  * Deletion is shard-aware and protected. The unit is a whole logical backup
+    (every shard of the set) or a cycle, never a single shard. A type-to-confirm
+    dialog discloses the blast radius (shard files, total bytes freed, dependent
+    incrementals) and requires typing the target's identifier — the Delete button
+    stays disabled until it matches (case-insensitive). The newest complete
+    backup and incremental-bearing fulls are flagged in red/amber.
+  * New worker actions back it: --delete-cycle CYCLE_ID and --delete-set
+    GROUP_ID. Both refuse the newest complete cycle / an incremental-bearing
+    full unless --force (the GUI passes --force after its type-to-confirm). The
+    file sweep now also removes the .failed-suffixed archive a failed shard
+    leaves behind and the .frames.json sidecar (a pre-existing prune leak).
+
+ -- Kim McCann <amplogik@gmail.com>  Sat, 13 Jun 2026 14:22:29 -0700
+
 timetraveller (1.1.2) unstable; urgency=medium
 
   * GUI: the plan editor now exposes a "Parallelism" control for sharding.
