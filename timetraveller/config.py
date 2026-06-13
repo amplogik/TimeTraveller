@@ -85,6 +85,18 @@ class PlanConfig:
     compression: str = "zstd"
     framed: bool = True
     extra_pax_flags: list[str] = field(default_factory=list)
+    shards: int | str = "auto"   # parallel write streams per backup; "auto" or int>=1
+
+    def configured_shards(self) -> int:
+        """Resolve `shards` to a concrete count ("auto" -> a CPU-based default).
+
+        This is the *configured* count; the write path further caps it by the
+        backup's size/file-count so tiny backups don't spawn empty shards.
+        """
+        if self.shards == "auto":
+            n = os.cpu_count() or 4
+            return max(1, min(n - 2, 4))
+        return int(self.shards)
 
     def validate(self) -> None:
         if not self.plan_name:
@@ -150,6 +162,10 @@ class PlanConfig:
             raise ValueError(f"retention.policy must be one of {RETENTION_POLICIES}")
         if self.compression not in COMPRESSIONS:
             raise ValueError(f"compression must be one of {COMPRESSIONS}")
+        if self.shards != "auto" and not (
+                isinstance(self.shards, int) and not isinstance(self.shards, bool)
+                and self.shards >= 1):
+            raise ValueError("shards must be 'auto' or an integer >= 1")
 
     def archive_dir(self, hostname: str | None = None) -> Path:
         """Compute destination directory for this plan, including hostname if enabled."""

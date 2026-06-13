@@ -1,3 +1,30 @@
+timetraveller (1.1.0) unstable; urgency=medium
+
+  * Sharding: a backup can now be written as N parallel pax|zstd streams to N
+    shard archives instead of one, using the otherwise-idle CPU cores. The
+    single-thread tar producer (not compression, not the 10GbE link) was the
+    write bottleneck; parallel shards raise throughput toward the storage
+    backend's ceiling. Because it optimises the client, the win is
+    backend-agnostic (NFS, SMB, S3, any target) — no server-side tuning needed.
+  * New per-plan `shards` setting: "auto" (default; min(cores-2, 4)) or an
+    integer. The count is capped at runtime by the backup's size (~1 GiB per
+    shard) and file count, so small backups and most incrementals stay
+    single-stream. `shards: 1` keeps the historical single-archive behaviour.
+  * One backup = one logical "shard set". The N shards share a shard_group and
+    are surfaced as a single backup to cycles and retention (a sharded full
+    counts as one cycle; all its shards are pruned together). Manifest schema
+    bumped to v2 (shard_index/shard_count/shard_group); v1 manifests load and
+    upgrade transparently.
+  * Restore is shard-aware: `--extract` accepts a shard-set stem (e.g.
+    2026-06-13_full), a shard filename, or a plain archive name and gathers the
+    requested files from whichever shards hold them. Each shard keeps its own
+    inline .idx.zst / .frames.json, so per-file fast-extract is unchanged.
+  * GUI lists every shard of a sharded backup (none hidden) and includes them
+    all in file search. (Collapsing a shard set into a single row with a merged
+    file tree is a planned follow-up.)
+
+ -- Kim McCann <amplogik@gmail.com>  Sat, 13 Jun 2026 10:49:17 -0700
+
 timetraveller (1.0.7) unstable; urgency=medium
 
   * Inline index build: framed backups now build the .idx.zst sidecar

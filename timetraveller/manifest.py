@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 MANIFEST_NAME = "manifest.json"
-SCHEMA_VERSION = 1
+# v2 adds the shard_* fields to ArchiveEntry. v1 manifests load fine (the new
+# fields default to the unsharded values) and are upgraded on next save.
+SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -33,6 +36,12 @@ class ArchiveEntry:
     notes: str = ""
     has_sidecar: bool = False   # True if the .idx.zst sidecar exists for this archive
     has_frames: bool = False    # True if the .frames.json sidecar exists (framed-zstd archive)
+    # Sharding: one logical backup may be split across N archive files ("shards"),
+    # each its own entry. Defaults describe an unsharded backup (one shard of one).
+    shard_index: int = 1        # 1-based position within the shard set
+    shard_count: int = 1        # total shards in this backup (1 = unsharded)
+    shard_group: str = ""       # logical-backup id shared by sibling shards;
+                                # "" means derive from the filename (legacy entries)
 
 
 @dataclass
@@ -62,25 +71,147 @@ class Manifest:
         self.archives = [a for a in self.archives if a.filename != filename]
 
 
+# Matches the ".sIofN" shard suffix that precedes ".pax.zst" in a shard filename.
+_SHARD_SUFFIX_RE = re.compile(r"\.s\d+of\d+(?=\.pax\.zst$)")
+
+
+def _group_id_from_filename(filename: str) -> str:
+    """Logical-backup id derived from a filename: strip the optional `.sIofN`
+    shard suffix and the `.pax.zst` extension.
+
+    `2026-06-13_full.s2of4.pax.zst` and `2026-06-13_full.pax.zst` both map to
+    `2026-06-13_full`.
+    """
+    name = _SHARD_SUFFIX_RE.sub("", filename)
+    if name.endswith(".pax.zst"):
+        name = name[: -len(".pax.zst")]
+    return name
+
+
+def group_id_for(entry: ArchiveEntry) -> str:
+    """The shard-group key for an entry: its stored `shard_group`, or (for
+    legacy entries that predate sharding) one derived from the filename."""
+    return entry.shard_group or _group_id_from_filename(entry.filename)
+
+
 @dataclass
-class Cycle:
-    """A full backup plus all incrementals taken before the next successful full."""
-    cycle_id: str
-    full: ArchiveEntry | None              # None if the full failed or is missing
-    incrementals: list[ArchiveEntry]
+class ShardSet:
+    """The N shard archives that make up ONE logical backup. Unsharded backups
+    are a set of one. Sibling shards share kind/cycle_id and partition the file
+    list with no overlap."""
+    group_id: str
+    members: list[ArchiveEntry]   # >= 1, sorted by shard_index
 
     @property
-    def archives(self) -> list[ArchiveEntry]:
-        return ([self.full] if self.full else []) + self.incrementals
+    def representative(self) -> ArchiveEntry:
+        return self.members[0]
+
+    @property
+    def kind(self) -> str:
+        return self.representative.kind
+
+    @property
+    def cycle_id(self) -> str:
+        return self.representative.cycle_id
+
+    @property
+    def shard_count(self) -> int:
+        return self.representative.shard_count
+
+    @property
+    def date_started(self) -> str:
+        return min(m.date_started for m in self.members)
+
+    @property
+    def date_finished(self) -> str:
+        fins = [m.date_finished for m in self.members if m.date_finished]
+        return max(fins) if fins else ""
+
+    @property
+    def total_size(self) -> int:
+        return sum(m.size_bytes for m in self.members if m.size_bytes)
+
+    @property
+    def status(self) -> str:
+        """Aggregate status: failed if any shard failed, in-progress if any is
+        still running, empty if all shards were empty, warnings if any shard
+        had warnings, else ok."""
+        sts = {m.status for m in self.members}
+        if "failed" in sts:
+            return "failed"
+        if "in-progress" in sts:
+            return "in-progress"
+        if sts == {"empty"}:
+            return "empty"
+        if "ok-with-warnings" in sts:
+            return "ok-with-warnings"
+        return "ok"
 
     @property
     def is_complete(self) -> bool:
-        """A cycle is complete iff it has a successful full backup.
+        """Complete iff EVERY shard succeeded (ok/ok-with-warnings). A single
+        failed shard makes the whole logical backup incomplete."""
+        return bool(self.members) and all(
+            m.status in ("ok", "ok-with-warnings") for m in self.members)
+
+
+def shard_sets(manifest: Manifest) -> list[ShardSet]:
+    """Group a manifest's entries into shard sets (one logical backup each),
+    sorted oldest-first by start time. Members within a set are sorted by
+    shard_index."""
+    groups: dict[str, list[ArchiveEntry]] = {}
+    for a in manifest.archives:
+        groups.setdefault(group_id_for(a), []).append(a)
+    sets = [ShardSet(group_id=gid, members=sorted(ms, key=lambda m: m.shard_index))
+            for gid, ms in groups.items()]
+    sets.sort(key=lambda s: s.date_started)
+    return sets
+
+
+@dataclass
+class Cycle:
+    """A full backup plus all incrementals taken before the next successful full.
+
+    Internally grouped by shard SET so a full split into N shards counts as one
+    logical full. The `full`/`incrementals`/`archives` properties preserve the
+    historical entry-level API for callers that predate sharding.
+    """
+    cycle_id: str
+    full_set: ShardSet | None              # None if the full failed or is missing
+    incr_sets: list[ShardSet]
+
+    @property
+    def full(self) -> ArchiveEntry | None:
+        """Representative full entry (lowest shard_index), or None."""
+        return self.full_set.representative if self.full_set else None
+
+    @property
+    def incrementals(self) -> list[ArchiveEntry]:
+        """Flat list of all incremental (and failed-full) shard entries."""
+        out: list[ArchiveEntry] = []
+        for s in self.incr_sets:
+            out.extend(s.members)
+        return out
+
+    @property
+    def archives(self) -> list[ArchiveEntry]:
+        """Every shard entry in the cycle (full + incrementals) — the unit of
+        deletion for retention."""
+        out: list[ArchiveEntry] = []
+        if self.full_set:
+            out.extend(self.full_set.members)
+        for s in self.incr_sets:
+            out.extend(s.members)
+        return out
+
+    @property
+    def is_complete(self) -> bool:
+        """Complete iff the full shard set is present and every shard succeeded.
 
         "ok-with-warnings" counts as successful — the archive is trustworthy
         (pax exit 1 is non-fatal warnings on the walk, not on the stream).
         """
-        return self.full is not None and self.full.status in ("ok", "ok-with-warnings")
+        return self.full_set is not None and self.full_set.is_complete
 
     @property
     def total_size(self) -> int:
@@ -88,43 +219,37 @@ class Cycle:
 
 
 def cycles(manifest: Manifest) -> list[Cycle]:
-    """Group archives into cycles.
+    """Group shard sets into cycles.
 
-    Rule: a successful full opens a new cycle. Incrementals attach to the most
-    recent open cycle. A failed full does NOT open a new cycle — subsequent
-    incrementals stay attached to the previous one. This keeps the restore
-    chain intact when a full backup fails.
+    Rule: a complete full SET opens a new cycle. Incremental sets attach to the
+    most recent open cycle. A failed full set does NOT open a new cycle — its
+    shards stay attached to the previous one. This keeps the restore chain
+    intact when a full backup fails.
 
     Returned cycles are sorted oldest-first.
     """
-    sorted_archives = sorted(manifest.archives, key=lambda a: a.date_started)
-
     result: list[Cycle] = []
     current: Cycle | None = None
 
-    for a in sorted_archives:
-        if a.kind == "full":
-            if a.status in ("ok", "ok-with-warnings"):
-                # Successful full — open a new cycle.
-                current = Cycle(cycle_id=a.cycle_id, full=a, incrementals=[])
+    for s in shard_sets(manifest):
+        if s.kind == "full":
+            if s.is_complete:
+                # Successful full set — open a new cycle.
+                current = Cycle(cycle_id=s.cycle_id, full_set=s, incr_sets=[])
                 result.append(current)
             else:
-                # Failed full — don't open a new cycle. Record it on the
-                # current cycle as a failed full for visibility, but don't
-                # replace the cycle's full backup.
+                # Failed full set — don't open a new cycle. Record its shards on
+                # the current cycle for visibility without replacing the full.
                 if current is None:
-                    # Failed full with no prior cycle. Create a stub cycle
-                    # marked incomplete so the GUI can surface the failure.
-                    current = Cycle(cycle_id=a.cycle_id, full=None, incrementals=[])
+                    current = Cycle(cycle_id=s.cycle_id, full_set=None, incr_sets=[])
                     result.append(current)
-                current.incrementals.append(a)
+                current.incr_sets.append(s)
         else:  # incr
             if current is None:
-                # Stray incremental with no prior full. Park it in a stub
-                # cycle so it doesn't disappear.
-                current = Cycle(cycle_id=a.cycle_id, full=None, incrementals=[])
+                # Stray incremental with no prior full. Park it in a stub cycle.
+                current = Cycle(cycle_id=s.cycle_id, full_set=None, incr_sets=[])
                 result.append(current)
-            current.incrementals.append(a)
+            current.incr_sets.append(s)
 
     return result
 
@@ -136,10 +261,18 @@ def load(path: Path) -> Manifest:
         return Manifest(plan_name="")
     with open(path) as f:
         data = json.load(f)
-    archives = [ArchiveEntry(**a) for a in data.get("archives", [])]
+    archives = []
+    for a in data.get("archives", []):
+        entry = ArchiveEntry(**a)
+        # Legacy (v1) entries have no shard_group; derive it so grouping works
+        # uniformly. shard_index/shard_count default to the unsharded values.
+        if not entry.shard_group:
+            entry.shard_group = _group_id_from_filename(entry.filename)
+        archives.append(entry)
+    # Read both v1 and v2; we always re-emit the current format on save.
     return Manifest(
         plan_name=data.get("plan_name", ""),
-        schema_version=data.get("schema_version", SCHEMA_VERSION),
+        schema_version=SCHEMA_VERSION,
         archives=archives,
     )
 
