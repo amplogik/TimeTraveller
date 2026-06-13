@@ -1,9 +1,19 @@
 # Design note: Archive management — delete control & sidecar resilience
 
-Status: **proposed** (2026-06-08; **revised 2026-06-13 for sharding**). Captures
-decisions from the 2026-06-08 working session, updated after client-side sharding
-landed (v1.1.0–v1.1.2). Prototype-first: build under `prototype/` and validate before
-touching the working app. Nothing in Features 1–2 is implemented yet.
+Status: **SHIPPED** (2026-06-13). Proposed 2026-06-08, revised 2026-06-13 for
+sharding, then implemented the same day:
+- **Feature 1 (delete)** — shipped **v1.2.0**: `--delete-cycle` / `--delete-set`
+  worker actions (shard-aware sweep incl. `.failed`/`.frames.json`, retention-
+  mirroring `--force` guards) + the GUI type-to-confirm dialog and right-click
+  context menu (Delete/Reindex/Recover; Reindex/Recover rehomed for discoverability).
+- **Feature 2 (sidecar resilience)** — shipped **v1.3.0**: per-shard
+  `<archive>.meta.json` (written on backup from the in-memory entry — no archive
+  re-read; backfilled by `--reindex`), manifest rebuild from a bare directory via
+  `--refresh-from-mount`, and the group-atomic export bundle
+  (`--export-cycle`/`--export-set --into`) with GUI "Export…" menu entries.
+- **2.3 self-priming restore** and the optional **post-move checksum** remain
+  unbuilt (the checksum intentionally so — it would re-read the whole archive;
+  see Feature 2.1). Everything else in Features 1–2 below is implemented.
 
 > **2026-06-13 sharding revision.** This note was written before sharding shipped, when
 > one logical backup == one `.pax.zst`. That is no longer true: a backup is now **N shard
