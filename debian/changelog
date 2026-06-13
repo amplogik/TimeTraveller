@@ -1,3 +1,24 @@
+timetraveller (1.0.5) unstable; urgency=medium
+
+  * Backup: a file vanishing mid-walk no longer fails the whole run.
+    The backup enumerates the file list first, then streams those paths
+    to GNU tar; volatile trees (browser caches, Brave's "Safe Browsing/
+    *.store") rotate constantly, so a listed file can be gone before tar
+    stats it. tar reports "Cannot stat: No such file or directory" and
+    exits 2 — but it skips the missing member and the archive stream
+    stays structurally valid, exactly the same benign race as the exit-1
+    "file changed as we read it" case. RunResult.status now downgrades a
+    tar exit >=2 to "ok-with-warnings" when every diagnostic is such a
+    per-file ENOENT (or the generic failure-summary trailer); the run
+    keeps its inline sidecar/frame index and is no longer quarantined to
+    a `.failed` file. Any other fatal line (ENOSPC, permission denied), a
+    zstd failure, or stderr we could not capture still fails the run.
+  * Internal: pax stderr is now captured (teed to the run log and kept,
+    bounded to 1 MiB, on RunResult.pax_stderr) via a reader thread in
+    pax.run/run_with_file_list so status classification can inspect it.
+
+ -- Kim McCann <amplogik@gmail.com>  Sat, 13 Jun 2026 06:02:39 -0700
+
 timetraveller (1.0.4) unstable; urgency=medium
 
   * GUI: Reindex button on the Archives panel for archives that are
