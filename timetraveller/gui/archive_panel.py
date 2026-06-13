@@ -25,7 +25,7 @@ from ..config import PlanConfig
 from ..index import sidecar_mirror_path
 from ..manifest import ArchiveEntry
 from .archive_tree_model import ArchiveTreeModel
-from .reindex_tracker import ReindexTracker
+from .reindex_tracker import RecoverTracker, ReindexTracker
 from .restore_dialog import RestoreDialog
 from .search_widget import SearchWidget
 
@@ -60,7 +60,8 @@ class ArchivePanel(QWidget):
 
     restore_requested = pyqtSignal()  # emitted after a successful extract
 
-    def __init__(self, parent=None, *, tracker: ReindexTracker | None = None):
+    def __init__(self, parent=None, *, tracker: ReindexTracker | None = None,
+                 recover_tracker: RecoverTracker | None = None):
         super().__init__(parent)
         self._plan: PlanConfig | None = None
         self._current_entry: ArchiveEntry | None = None
@@ -71,6 +72,7 @@ class ArchivePanel(QWidget):
         # can ignore late-arriving results from a previous selection.
         self._pending_archive: str | None = None
         self._tracker = tracker
+        self._recover_tracker = recover_tracker
 
         layout = QVBoxLayout(self)
 
@@ -106,6 +108,14 @@ class ArchivePanel(QWidget):
         self._reindex_btn.setVisible(False)
         self._reindex_btn.clicked.connect(self._on_reindex_clicked)
         header_row.addWidget(self._reindex_btn)
+        self._recover_btn = QPushButton("Recover")
+        self._recover_btn.setToolTip(
+            "Attempt to recover this failed backup: verify the archive stream "
+            "is intact, rebuild its index, and mark it ok-with-warnings."
+        )
+        self._recover_btn.setVisible(False)
+        self._recover_btn.clicked.connect(self._on_recover_clicked)
+        header_row.addWidget(self._recover_btn)
         self._search_btn = QPushButton("🔍 Search files…")
         self._search_btn.setToolTip(
             "Find a filename across every archive in this plan"
@@ -117,6 +127,9 @@ class ArchivePanel(QWidget):
         if self._tracker is not None:
             self._tracker.started.connect(self._on_reindex_started)
             self._tracker.finished.connect(self._on_reindex_finished)
+        if self._recover_tracker is not None:
+            self._recover_tracker.started.connect(self._on_recover_started)
+            self._recover_tracker.finished.connect(self._on_recover_finished)
 
         self._file_tree = QTreeView()
         self._file_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -238,9 +251,10 @@ class ArchivePanel(QWidget):
             self._pending_archive = None
             return
 
-        # Sidecar is recorded; hide the button used for the missing-sidecar
-        # warning so it doesn't linger over a healthy archive's pane.
+        # Sidecar is recorded; hide the recovery/reindex buttons so they don't
+        # linger over a healthy archive's pane.
         self._reindex_btn.setVisible(False)
+        self._recover_btn.setVisible(False)
 
         sc = sidecar_mirror_path(self._plan.plan_name, entry.filename)
         if not sc.exists():
@@ -303,32 +317,49 @@ class ArchivePanel(QWidget):
         self._set_file_tree(None)
         self._pending_archive = None
 
-    # ---------- reindex button ----------
+    # ---------- reindex / recover buttons ----------
 
     def _show_no_sidecar(self, entry: ArchiveEntry) -> None:
-        """Render the no-sidecar warning, swapping in the running/idle state
-        from the tracker. Failed-status archives never get a Reindex button
-        because their archive file is at the .failed suffix on disk and the
-        worker's --reindex would fail to open it.
+        """Render the no-sidecar state, swapping in the running/idle button
+        from whichever tracker applies.
+
+        Failed-status archives get a Recover button (not Reindex): their
+        archive file is at the .failed suffix on disk, so --reindex can't open
+        it — recovery renames it back, verifies the stream, and rebuilds the
+        index in one pass. Non-failed no-sidecar archives get the Reindex
+        button as before.
         """
         plan_name = self._plan.plan_name if self._plan else ""
-        running = (self._tracker.running_for(plan_name, entry.filename)
-                   if self._tracker else None)
-        if running is not None:
+        recovering = (self._recover_tracker.running_for(plan_name, entry.filename)
+                      if self._recover_tracker else None)
+        reindexing = (self._tracker.running_for(plan_name, entry.filename)
+                      if self._tracker else None)
+
+        if recovering is not None:
+            self._archive_label.setText(
+                f"<b>{entry.filename}</b> — backup failed (Recovering now)"
+            )
+            self._reindex_btn.setVisible(False)
+            self._recover_btn.setVisible(False)
+            return
+        if reindexing is not None:
             self._archive_label.setText(
                 f"<b>{entry.filename}</b> — no sidecar index (Indexing now)"
             )
             self._reindex_btn.setVisible(False)
+            self._recover_btn.setVisible(False)
             return
         if entry.status == "failed":
             self._archive_label.setText(
-                f"<b>{entry.filename}</b> — backup failed; archive incomplete"
+                f"<b>{entry.filename}</b> — backup failed; attempt recovery?"
             )
             self._reindex_btn.setVisible(False)
+            self._recover_btn.setVisible(self._recover_tracker is not None)
             return
         self._archive_label.setText(
             f"<b>{entry.filename}</b> — no sidecar index"
         )
+        self._recover_btn.setVisible(False)
         self._reindex_btn.setVisible(self._tracker is not None)
 
     def _selected_archive_entry(self) -> ArchiveEntry | None:
@@ -379,6 +410,53 @@ class ArchivePanel(QWidget):
         # Success: --reindex flipped has_sidecar in the manifest mirror;
         # reload the listing and re-select the archive so the file tree
         # loads automatically.
+        was_selected = self._selected_archive_entry()
+        target = archive if (was_selected and was_selected.filename == archive) else None
+        self.refresh()
+        if target is not None:
+            self._select_archive(target)
+
+    def _on_recover_clicked(self) -> None:
+        if self._plan is None or self._recover_tracker is None:
+            return
+        entry = self._selected_archive_entry()
+        if entry is None or entry.status != "failed":
+            return
+        handle = self._recover_tracker.start(self._plan.plan_name, entry.filename)
+        if handle is None:
+            QMessageBox.warning(
+                self, "Recovery failed to launch",
+                f"Could not start recovery for {entry.filename}.",
+            )
+            return
+        # Repaint immediately for the user who just clicked; the tracker's
+        # `started` signal will also fire and is idempotent for this archive.
+        self._show_no_sidecar(entry)
+
+    def _on_recover_started(self, plan_name: str, archive: str) -> None:
+        if self._plan is None or plan_name != self._plan.plan_name:
+            return
+        entry = self._selected_archive_entry()
+        if entry is not None and entry.filename == archive and entry.status == "failed":
+            self._show_no_sidecar(entry)
+
+    def _on_recover_finished(self, plan_name: str, archive: str,
+                             ok: bool, log_tail: str) -> None:
+        if self._plan is None or plan_name != self._plan.plan_name:
+            return
+        if not ok:
+            QMessageBox.warning(
+                self, f"Recovery failed: {archive}",
+                f"{archive} could not be recovered — its archive stream is "
+                f"likely truncated or corrupt.\n\n{log_tail or '(no output captured)'}",
+            )
+            # Restore the failed state so the Recover button reappears for retry.
+            entry = self._selected_archive_entry()
+            if entry is not None and entry.filename == archive and not entry.has_sidecar:
+                self._show_no_sidecar(entry)
+            return
+        # Success: recovery flipped status->ok-with-warnings and has_sidecar in
+        # the manifest mirror; reload + re-select so the file tree loads.
         was_selected = self._selected_archive_entry()
         target = archive if (was_selected and was_selected.filename == archive) else None
         self.refresh()

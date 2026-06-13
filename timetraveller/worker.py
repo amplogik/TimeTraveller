@@ -69,6 +69,14 @@ def build_parser() -> argparse.ArgumentParser:
                               "between archive-write and manifest-save. Backfills status, "
                               "date_finished, size_bytes, has_sidecar, has_frames from what's "
                               "on disk. Run --reindex first if the sidecar also needs regenerating.")
+    actions.add_argument("--recover-failed", metavar="FILE", default=None,
+                         help="Recover a backup marked 'failed' whose archive stream is "
+                              "actually intact (e.g. a file vanished mid-walk -> tar exit 2). "
+                              "Renames <FILE>.failed back to <FILE>, builds the .idx.zst "
+                              "sidecar (which streams the whole archive and so doubles as an "
+                              "integrity check), and finalizes the manifest entry to "
+                              "'ok-with-warnings'. If the stream is truncated or corrupt the "
+                              "archive is re-quarantined and the entry stays 'failed'.")
     actions.add_argument("--verify", type=str, default=None,
                          help="Stream the named archive through pax -r to /dev/null to check integrity.")
     actions.add_argument("--extract", type=str, default=None, metavar="ARCHIVE",
@@ -155,7 +163,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "have emitted non-fatal warnings whose result is no longer available.")
     p.add_argument("--force", action="store_true",
                    help="With --finalize-archive: allow overwriting an entry that already "
-                        "has a terminal status (ok / ok-with-warnings / failed / empty).")
+                        "has a terminal status (ok / ok-with-warnings / failed / empty). "
+                        "With --recover-failed: allow recovering an entry whose status "
+                        "isn't 'failed'.")
     p.add_argument("--manual", action="store_true",
                    help="Mark this as a manual (not scheduled) run; uses HHMMSS in the filename "
                         "to avoid colliding with same-day scheduled runs.")
@@ -589,6 +599,77 @@ def action_finalize_archive(args: argparse.Namespace, plan: configlib.PlanConfig
     _log(args, f"  status={entry.status}  size={entry.size_bytes/1024**2:.1f} MiB  "
                f"date_finished={entry.date_finished}")
     _log(args, f"  has_sidecar={entry.has_sidecar}  has_frames={entry.has_frames}")
+    return 0
+
+
+def action_recover_failed(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
+    """Recover a failed backup whose archive stream is actually intact.
+
+    A backup marked 'failed' has its archive renamed to '<name>.failed' on
+    disk (see action_backup) while the manifest keeps the bare filename. Some
+    failures leave a structurally valid stream — most commonly a file vanishing
+    mid-walk, which GNU tar reports as exit 2 even though it skips the member
+    and the archive stays sound (the same benign race v1.0.5's status
+    classification now tolerates for new runs). Others (truncation, zstd
+    corruption) do not.
+
+    We build the .idx.zst sidecar straight off the archive. write_sidecar
+    streams the whole thing through tarfile, so a clean completion *is* the
+    integrity proof; any read/parse error means the stream is unusable. Only on
+    success do we un-quarantine the file and finalize the entry. On failure the
+    archive is left (or put back) at its .failed name so the manifest's
+    failed-status <-> .failed-on-disk invariant holds for a later retry.
+    """
+    archive_dir = plan.archive_dir()
+    fname = args.recover_failed
+    m = manifestlib.load(manifestlib.manifest_path(archive_dir))
+    entry = next((a for a in m.archives if a.filename == fname), None)
+    if entry is None:
+        print(f"ERROR: no manifest entry for {fname!r}. --recover-failed updates "
+              f"an existing row; it does not create one.", file=sys.stderr)
+        return 1
+    if entry.status != "failed" and not args.force:
+        print(f"ERROR: entry status is {entry.status!r}, not 'failed'. "
+              f"Pass --force to recover anyway.", file=sys.stderr)
+        return 1
+
+    bare = archive_dir / fname
+    failed = bare.with_suffix(bare.suffix + ".failed")
+    # Normally the archive is at <name>.failed; accept a bare file too, so a
+    # prior recovery that renamed then crashed before finalize re-runs cleanly.
+    if failed.exists():
+        failed.rename(bare)
+    elif not bare.exists():
+        print(f"ERROR: archive not found at {failed} or {bare}.", file=sys.stderr)
+        return 1
+
+    _log(args, f"recover: {fname} — verifying + indexing…")
+    try:
+        indexlib.write_sidecar(bare)
+    except Exception as e:  # noqa: BLE001 - any read/parse error means unrecoverable
+        # Re-quarantine so manifest(failed) <-> disk(.failed) stays consistent.
+        try:
+            if bare.exists():
+                bare.rename(failed)
+        except OSError:
+            pass
+        print(f"ERROR: {fname} is not recoverable — archive stream is truncated "
+              f"or corrupt: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
+
+    sidecar = indexlib.sidecar_path(bare)
+    _mirror_sidecar(plan.plan_name, sidecar, fname)
+
+    entry.status = "ok-with-warnings"
+    entry.date_finished = datetime.now(timezone.utc).isoformat()
+    entry.size_bytes = bare.stat().st_size
+    entry.has_sidecar = True
+    entry.has_frames = framewriter.sidecar_path(bare).exists()
+    _save_manifest(m, archive_dir, plan.plan_name)
+
+    _log(args, f"recover: {fname} -> {entry.status}")
+    _log(args, f"  size={entry.size_bytes/1024**2:.1f} MiB  "
+               f"has_sidecar={entry.has_sidecar}  has_frames={entry.has_frames}")
     return 0
 
 
@@ -1345,6 +1426,8 @@ def main(argv: list[str] | None = None) -> int:
         return action_reindex(args, plan)
     if args.finalize_archive:
         return action_finalize_archive(args, plan)
+    if args.recover_failed:
+        return action_recover_failed(args, plan)
     if args.verify:
         return action_verify(args, plan)
     if args.extract:

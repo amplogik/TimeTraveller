@@ -55,19 +55,28 @@ def _spin_until(predicate, timeout_s=5.0) -> bool:
 
 
 def test_state_dir_creates_under_xdg(xdg):
-    d = rt.state_dir("home")
+    d = rt.state_dir("home", "reindex")
     assert d == xdg / "timetraveller" / "home" / "reindex"
     assert d.is_dir()
 
 
 def test_state_files_paths(xdg):
-    p = rt.pid_file("home", "2026-05-31_full.pax.zst")
-    l = rt.log_file("home", "2026-05-31_full.pax.zst")
-    d = rt.done_file("home", "2026-05-31_full.pax.zst")
+    p = rt.pid_file("home", "2026-05-31_full.pax.zst", "reindex")
+    l = rt.log_file("home", "2026-05-31_full.pax.zst", "reindex")
+    d = rt.done_file("home", "2026-05-31_full.pax.zst", "reindex")
     base = xdg / "timetraveller" / "home" / "reindex"
     assert p == base / "2026-05-31_full.pax.zst.pid"
     assert l == base / "2026-05-31_full.pax.zst.log"
     assert d == base / "2026-05-31_full.pax.zst.done"
+
+
+def test_recover_tracker_uses_distinct_subdir_and_flag(xdg):
+    # RecoverTracker must not collide with reindex state for the same archive.
+    assert rt.RecoverTracker.ACTION_FLAG == "--recover-failed"
+    assert rt.RecoverTracker.SUBDIR == "recover"
+    archive = "2026-06-13_incr.pax.zst"
+    assert rt.state_dir("home", "recover") == xdg / "timetraveller" / "home" / "recover"
+    assert rt.pid_file("home", archive, "recover") != rt.pid_file("home", archive, "reindex")
 
 
 def test_alive_for_current_process():
@@ -99,8 +108,8 @@ def test_pid_is_reindex_matches_cmdline(tmp_path):
     try:
         # Give it a moment to exec.
         time.sleep(0.1)
-        assert rt._pid_is_reindex(p.pid, archive) is True
-        assert rt._pid_is_reindex(p.pid, "other.pax.zst") is False
+        assert rt._pid_runs_job(p.pid, archive, "--reindex") is True
+        assert rt._pid_runs_job(p.pid, "other.pax.zst", "--reindex") is False
     finally:
         p.terminate()
         p.wait()
@@ -108,11 +117,11 @@ def test_pid_is_reindex_matches_cmdline(tmp_path):
 
 def test_pid_is_reindex_false_for_unrelated_process():
     # The test process itself isn't a reindex.
-    assert rt._pid_is_reindex(os.getpid(), "anything") is False
+    assert rt._pid_runs_job(os.getpid(), "anything", "--reindex") is False
 
 
 def test_pid_is_reindex_false_for_dead_pid():
-    assert rt._pid_is_reindex(2**22, "anything") is False  # almost certainly unused
+    assert rt._pid_runs_job(2**22, "anything", "--reindex") is False  # almost certainly unused
 
 
 def test_read_log_tail_handles_missing(tmp_path):
@@ -172,7 +181,7 @@ def test_tracker_start_creates_pid_file_and_emits_started(xdg, qapp, monkeypatch
 
     handle = tracker.start("home", "2026-05-31_full.pax.zst")
     assert handle is not None
-    assert rt.pid_file("home", "2026-05-31_full.pax.zst").exists()
+    assert rt.pid_file("home", "2026-05-31_full.pax.zst", "reindex").exists()
     assert started == [("home", "2026-05-31_full.pax.zst")]
     assert tracker.running_for("home", "2026-05-31_full.pax.zst") is handle
 
@@ -181,10 +190,10 @@ def test_tracker_start_creates_pid_file_and_emits_started(xdg, qapp, monkeypatch
     tracker.finished.connect(lambda p, a, ok, log: finished.append((p, a, ok)))
     _spin_until(lambda: bool(finished), timeout_s=5.0)
     assert finished and finished[0] == ("home", "2026-05-31_full.pax.zst", True)
-    assert not rt.pid_file("home", "2026-05-31_full.pax.zst").exists()
-    assert not rt.done_file("home", "2026-05-31_full.pax.zst").exists()
+    assert not rt.pid_file("home", "2026-05-31_full.pax.zst", "reindex").exists()
+    assert not rt.done_file("home", "2026-05-31_full.pax.zst", "reindex").exists()
     # Log stays for diagnostics.
-    assert rt.log_file("home", "2026-05-31_full.pax.zst").exists()
+    assert rt.log_file("home", "2026-05-31_full.pax.zst", "reindex").exists()
 
 
 def test_tracker_start_returns_existing_handle_for_same_archive(xdg, qapp, monkeypatch):
@@ -214,7 +223,7 @@ def test_tracker_emits_failed_on_nonzero_exit(xdg, qapp, monkeypatch):
 
 def test_adopt_drops_stale_pid_files(xdg, qapp):
     # Seed a pid file for a long-dead pid; adopt() should clean it up.
-    d = rt.state_dir("home")
+    d = rt.state_dir("home", "reindex")
     (d / "ghost.pax.zst.pid").write_text("2147483")  # impossibly high pid
     tracker = rt.ReindexTracker()
     adopted = tracker.adopt("home")
@@ -227,9 +236,9 @@ def test_adopt_picks_up_live_reindex(xdg, qapp):
     # comment line below stays in the outer bash's argv[2] so its cmdline
     # carries "--reindex <archive>" for the adoption guard.
     archive = "C.pax.zst"
-    log_path = rt.log_file("home", archive)
-    done_path = rt.done_file("home", archive)
-    pid_path = rt.pid_file("home", archive)
+    log_path = rt.log_file("home", archive, "reindex")
+    done_path = rt.done_file("home", archive, "reindex")
+    pid_path = rt.pid_file("home", archive, "reindex")
     wrapper = (
         f"# --reindex {archive}\n"
         f"echo hello >{log_path} 2>&1\n"

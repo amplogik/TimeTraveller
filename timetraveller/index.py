@@ -141,15 +141,26 @@ def write_sidecar(archive_path: Path) -> Path:
     cctx = zstd.ZstdCompressor(level=3)
     dctx = zstd.ZstdDecompressor()
 
-    with open(archive_path, "rb") as comp_in:
-        with dctx.stream_reader(comp_in) as tar_stream:
-            with open(tmp, "wb") as raw_out:
-                with cctx.stream_writer(raw_out) as zstd_out:
-                    zstd_out.write((json.dumps(header) + "\n").encode())
-                    with tarfile.open(fileobj=tar_stream, mode="r|") as tf:
-                        for ti in tf:
-                            rec = _tarinfo_to_record(ti)
-                            zstd_out.write((json.dumps(rec) + "\n").encode())
+    try:
+        with open(archive_path, "rb") as comp_in:
+            with dctx.stream_reader(comp_in) as tar_stream:
+                with open(tmp, "wb") as raw_out:
+                    with cctx.stream_writer(raw_out) as zstd_out:
+                        zstd_out.write((json.dumps(header) + "\n").encode())
+                        with tarfile.open(fileobj=tar_stream, mode="r|") as tf:
+                            for ti in tf:
+                                rec = _tarinfo_to_record(ti)
+                                zstd_out.write((json.dumps(rec) + "\n").encode())
+    except BaseException:
+        # A truncated/corrupt archive raises mid-stream (tarfile.ReadError, a
+        # zstd error, etc.). Don't leave the partial .tmp behind — callers that
+        # run this as an integrity gate (e.g. --recover-failed) rely on a clean
+        # tree on failure.
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
 
     os.replace(tmp, sidecar)
     return sidecar

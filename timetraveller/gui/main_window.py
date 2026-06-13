@@ -26,7 +26,7 @@ from ..config import PlanConfig
 from .archive_panel import ArchivePanel
 from .help_dialog import HelpDialog
 from .plan_panel import PlanPanel
-from .reindex_tracker import ReindexTracker
+from .reindex_tracker import RecoverTracker, ReindexTracker
 from .run_dialog import WorkerRunDialog
 from .schedule_panel import SchedulePanel
 
@@ -139,7 +139,9 @@ class MainWindow(QMainWindow):
         self._plan_panel = PlanPanel()
         self._schedule_panel = SchedulePanel()
         self._reindex_tracker = ReindexTracker(self)
-        self._archive_panel = ArchivePanel(tracker=self._reindex_tracker)
+        self._recover_tracker = RecoverTracker(self)
+        self._archive_panel = ArchivePanel(tracker=self._reindex_tracker,
+                                           recover_tracker=self._recover_tracker)
         self._tabs.addTab(self._plan_panel, "Plan")
         self._tabs.addTab(self._schedule_panel, "Schedule")
         self._tabs.addTab(self._archive_panel, "Archives")
@@ -228,10 +230,11 @@ class MainWindow(QMainWindow):
             return
         self._plan_panel.load_plan(plan)
         self._schedule_panel.load_plan(plan)
-        # Pick up any reindex launched by a prior GUI session for this plan
-        # before the panel renders, so the "Indexing now" label shows up on
-        # first selection rather than after a refresh.
+        # Pick up any reindex/recovery launched by a prior GUI session for this
+        # plan before the panel renders, so the "Indexing/Recovering now" label
+        # shows up on first selection rather than after a refresh.
         self._reindex_tracker.adopt(plan.plan_name)
+        self._recover_tracker.adopt(plan.plan_name)
         self._archive_panel.load_plan(plan)
         self._dirty = False
         self._update_status()
@@ -523,6 +526,7 @@ class MainWindow(QMainWindow):
                 self._plan_panel.load_plan(plan)
                 self._schedule_panel.load_plan(plan)
                 self._reindex_tracker.adopt(plan.plan_name)
+                self._recover_tracker.adopt(plan.plan_name)
                 self._archive_panel.load_plan(plan)
         self._dirty = False
         self._update_status()

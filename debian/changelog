@@ -1,3 +1,31 @@
+timetraveller (1.0.6) unstable; urgency=medium
+
+  * New --recover-failed action: un-quarantine a backup marked 'failed'
+    whose archive stream is actually intact. A failed run renames its
+    archive to <name>.failed on disk while the manifest keeps the bare
+    name; some failures (most commonly a file vanishing mid-walk -> tar
+    exit 2, the same benign race v1.0.5 now tolerates for new runs) leave
+    a structurally valid stream, others (truncation, zstd corruption) do
+    not. The action renames <name>.failed back, builds the .idx.zst
+    sidecar straight off the archive -- which streams the whole thing
+    through tarfile and so doubles as the integrity gate -- and finalizes
+    the manifest entry to 'ok-with-warnings'. If the stream is truncated
+    or corrupt the archive is re-quarantined to .failed and the entry
+    stays 'failed', so the manifest<->disk invariant holds for a retry.
+  * GUI: failed archives now offer a Recover button on the Archives panel
+    instead of the previous "backup failed; archive incomplete" dead-end.
+    It launches --recover-failed as a detached, restart-surviving job
+    (same machinery as the v1.0.4 Reindex button, now generalized to
+    arbitrary worker jobs under per-action state subdirs); on success the
+    listing refreshes and the file tree loads, on failure a modal shows
+    the log tail and re-offers the button for retry.
+  * index.write_sidecar no longer leaves a partial <name>.idx.zst.tmp
+    behind when the archive stream raises mid-read (surfaced by running
+    the sidecar build as a recovery integrity gate); the temp file is
+    removed before the error propagates.
+
+ -- Kim McCann <amplogik@gmail.com>  Sat, 13 Jun 2026 06:25:23 -0700
+
 timetraveller (1.0.5) unstable; urgency=medium
 
   * Backup: a file vanishing mid-walk no longer fails the whole run.
