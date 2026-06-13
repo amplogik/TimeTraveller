@@ -15,8 +15,8 @@ from pathlib import Path
 
 from PyQt6.QtCore import QModelIndex, QObject, Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QDialog, QHBoxLayout, QHeaderView, QLabel, QMenu,
-    QMessageBox, QPushButton, QSplitter, QStackedWidget, QTreeView,
+    QAbstractItemView, QDialog, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
+    QMenu, QMessageBox, QPushButton, QSplitter, QStackedWidget, QTreeView,
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -385,12 +385,32 @@ class ArchivePanel(QWidget):
                 menu.addAction("Reindex (rebuild sidecar)", self._on_reindex_clicked)
             if not menu.isEmpty():
                 menu.addSeparator()
+            menu.addAction("Export backup…", lambda: self._export_set(s))
             menu.addAction("Delete backup…", lambda: self._delete_set(s))
         elif isinstance(data, CycleListing):
+            menu.addAction("Export cycle…", lambda: self._export_cycle(data))
             menu.addAction("Delete cycle…", lambda: self._delete_cycle(data))
         else:
             return
         menu.exec(self._archive_list.viewport().mapToGlobal(pos))
+
+    def _export_into(self, kind: str, ident: str, what: str) -> None:
+        """Prompt for a target directory and ask the worker to copy the bundle
+        there. Non-destructive, so no type-to-confirm — just a directory pick."""
+        if self._plan is None:
+            return
+        target = QFileDialog.getExistingDirectory(
+            self, f"Export {what} into…")
+        if not target:
+            return
+        self.worker_requested.emit(
+            f"Export {what}", [kind, ident, "--into", target])
+
+    def _export_set(self, s: manifestlib.ShardSet) -> None:
+        self._export_into("--export-set", s.group_id, f"backup {s.group_id}")
+
+    def _export_cycle(self, cycle: CycleListing) -> None:
+        self._export_into("--export-cycle", cycle.cycle_id, f"cycle {cycle.cycle_id}")
 
     def _listing(self):
         """Current archive listing from the local mirror (no mount access)."""

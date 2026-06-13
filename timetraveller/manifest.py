@@ -303,6 +303,56 @@ def manifest_path(archive_dir: Path) -> Path:
     return archive_dir / MANIFEST_NAME
 
 
+# ---- per-shard self-describing sidecars (<archive>.meta.json) ----
+#
+# One serialized ArchiveEntry written next to each shard archive. It carries the
+# shard fields, so a bare directory of archives (detached from manifest.json)
+# regroups into shard sets and rebuilds into a manifest. Derived data — losing it
+# costs nothing; --reindex backfills it.
+
+META_SUFFIX = ".meta.json"
+
+
+def entry_meta_path(archive_dir: Path, filename: str) -> Path:
+    return archive_dir / (filename + META_SUFFIX)
+
+
+def write_entry_meta(archive_dir: Path, entry: ArchiveEntry) -> None:
+    """Atomically write <archive>.meta.json for one shard entry."""
+    path = entry_meta_path(archive_dir, entry.filename)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump(asdict(entry), f, indent=2)
+        f.write("\n")
+    tmp.replace(path)
+
+
+def read_entry_meta(path: Path) -> ArchiveEntry:
+    """Parse one <archive>.meta.json into an ArchiveEntry, deriving shard_group
+    from the filename for any legacy meta that predates the shard fields."""
+    with open(path) as f:
+        data = json.load(f)
+    entry = ArchiveEntry(**data)
+    if not entry.shard_group:
+        entry.shard_group = _group_id_from_filename(entry.filename)
+    return entry
+
+
+def manifest_from_meta(archive_dir: Path, plan_name: str) -> Manifest:
+    """Rebuild a manifest by scanning <archive_dir> for *.meta.json sidecars.
+
+    Skips unreadable/foreign meta files rather than failing the whole rebuild.
+    Entries are grouped/sorted by the normal model when the manifest is read.
+    """
+    entries: list[ArchiveEntry] = []
+    for p in sorted(archive_dir.glob("*" + META_SUFFIX)):
+        try:
+            entries.append(read_entry_meta(p))
+        except (OSError, ValueError, TypeError):
+            continue
+    return Manifest(plan_name=plan_name, archives=entries)
+
+
 def mirror_manifest_path(plan_name: str) -> Path:
     """Local-disk mirror of the on-mount manifest, used by browse paths
     that must never block on the NFS mount.

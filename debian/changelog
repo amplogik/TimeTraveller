@@ -1,3 +1,23 @@
+timetraveller (1.3.0) unstable; urgency=medium
+
+  * Self-describing archives: each shard now gets a <archive>.meta.json sidecar
+    (one serialized manifest entry, incl. the shard fields). It is written on
+    backup from the in-memory entry -- NO extra read of the archive, so the
+    single-read write path from the inline-index work is preserved. --reindex
+    backfills it for older archives.
+  * Manifest rebuild from a bare directory: --list-archives --refresh-from-mount
+    now reconstructs a lost/absent on-mount manifest.json from the .meta.json
+    sidecars (grouping shards back into sets), so a hand-moved or partially-
+    restored archive directory becomes browsable again.
+  * Export bundle: --export-cycle CYCLE_ID / --export-set GROUP_ID --into DIR
+    copy a whole logical backup (every shard + .idx.zst/.frames.json/.meta.json
+    sidecars + a self-contained manifest slice) as one group-atomic set, and
+    refuse to write a partial bundle if a shard is missing on the mount. GUI:
+    "Export cycle…" / "Export backup…" in the Archives right-click menu (pick a
+    target directory; non-destructive, so no type-to-confirm).
+
+ -- Kim McCann <amplogik@gmail.com>  Sat, 13 Jun 2026 14:28:31 -0700
+
 timetraveller (1.2.0) unstable; urgency=medium
 
   * Archive management: delete a backup or a whole cycle from the GUI. Right-

@@ -96,6 +96,13 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Delete one logical backup (its shard set) by "
                               "group_id. Refuses an incremental-bearing full or "
                               "the newest complete full unless --force.")
+    actions.add_argument("--export-cycle", metavar="CYCLE_ID", default=None,
+                         help="Copy a whole cycle (all shards + sidecars + "
+                              ".meta.json + a manifest slice) into --into. "
+                              "Group-atomic: never writes a partial set.")
+    actions.add_argument("--export-set", metavar="GROUP_ID", default=None,
+                         help="Copy one logical backup (its shard set + sidecars "
+                              "+ .meta.json + a manifest slice) into --into.")
     actions.add_argument("--remove-plan", action="store_true",
                          help="Uninstall the plan's schedule, delete its config file, "
                               "and clear its local mirror state. By default, archive "
@@ -354,13 +361,27 @@ def _effective_shards(configured: int, work: list) -> int:
     return max(1, min(configured, total // _MIN_SHARD_BYTES, len(work)))
 
 
+def _write_entry_meta(archive_dir: Path, m: manifestlib.Manifest,
+                      fname: str, args: argparse.Namespace) -> None:
+    """Write the per-shard <archive>.meta.json for fname's (finalized) entry.
+    Best-effort: a meta-write failure must never fail the backup."""
+    entry = next((e for e in m.archives if e.filename == fname), None)
+    if entry is None:
+        return
+    try:
+        manifestlib.write_entry_meta(archive_dir, entry)
+    except OSError as e:
+        print(f"WARNING: {fname}: meta sidecar write failed: {e}", file=sys.stderr)
+
+
 def _finalize_one(m: manifestlib.Manifest, archive_path: Path, fname: str,
                   result, plan: configlib.PlanConfig, args: argparse.Namespace,
                   log_path: Path) -> str:
     """Post-run handling for ONE archive (shard or whole backup): mirror/build
-    the sidecar, rename to .failed on failure, and update the manifest entry.
-    Returns the archive's status. Does not prune or save the manifest — the
-    caller does that once all shards are finalized."""
+    the sidecar, rename to .failed on failure, write the .meta.json self-
+    describing sidecar, and update the manifest entry. Returns the archive's
+    status. Does not prune or save the manifest — the caller does that once all
+    shards are finalized."""
     status = result.status
     if status == "failed":
         m.update_status(fname, status=status,
@@ -372,6 +393,8 @@ def _finalize_one(m: manifestlib.Manifest, archive_path: Path, fname: str,
             archive_path.rename(archive_path.with_suffix(archive_path.suffix + ".failed"))
         except OSError:
             pass
+        # Describe the failed shard too — manifest rebuild should see it.
+        _write_entry_meta(archive_path.parent, m, fname, args)
         return status
 
     if status == "ok-with-warnings":
@@ -401,6 +424,7 @@ def _finalize_one(m: manifestlib.Manifest, archive_path: Path, fname: str,
             if has_sidecar:
                 entry.has_sidecar = True
             break
+    _write_entry_meta(archive_path.parent, m, fname, args)
     _log(args, f"  {fname}: {result.archive_size/1024**2:.1f} MiB"
                + ("  (sidecar built inline)" if result.index_built else ""))
     return status
@@ -426,6 +450,16 @@ def action_list_archives(args: argparse.Namespace, plan: configlib.PlanConfig) -
 
     if args.refresh_from_mount:
         on_mount = manifestlib.load(manifestlib.manifest_path(archive_dir))
+        # Self-healing: if there's no manifest on the mount (lost/corrupt, or a
+        # hand-moved directory of archives), rebuild it from the per-shard
+        # .meta.json sidecars before backfilling.
+        if not on_mount.archives:
+            rebuilt = manifestlib.manifest_from_meta(archive_dir, plan.plan_name)
+            if rebuilt.archives:
+                print(f"NOTE: no archives in on-mount manifest; rebuilt "
+                      f"{len(rebuilt.archives)} entr(ies) from .meta.json sidecars.",
+                      file=sys.stderr)
+                on_mount = rebuilt
         # Backfill has_sidecar / has_frames from disk and seed the local sidecar
         # mirror while we're already touching the mount.
         for entry in on_mount.archives:
@@ -639,6 +673,9 @@ def action_reindex(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
         entry = by_filename.get(a.name)
         if entry is not None:
             entry.has_sidecar = True
+            # Backfill the self-describing sidecar for archives written before
+            # .meta.json existed (or with a stale/missing meta).
+            _write_entry_meta(archive_dir, m, a.name, args)
         _mirror_sidecar(plan.plan_name, indexlib.sidecar_path(a), a.name)
     _save_manifest(m, archive_dir, plan.plan_name)
     return 0
@@ -953,6 +990,91 @@ def action_delete_set(args: argparse.Namespace, plan: configlib.PlanConfig) -> i
     n = _delete_sets(archive_dir, plan.plan_name, [target], m,
                      log=lambda msg: _log(args, msg))
     _log(args, f"delete-set {gid}: removed {n} shard archive(s).")
+    return 0
+
+
+def _member_files(archive_dir: Path, filename: str) -> list[Path]:
+    """Every on-disk file for one shard entry (archive or `.failed`, sidecars,
+    frames, meta), by the same filename-prefix sweep used for deletion."""
+    try:
+        return sorted(p for p in archive_dir.iterdir()
+                      if p.name == filename or p.name.startswith(filename + "."))
+    except FileNotFoundError:
+        return []
+
+
+def action_export(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
+    """Copy a cycle or one logical backup — every shard's archive + sidecars +
+    .meta.json, plus a manifest slice — into --into, as one atomic bundle.
+
+    Group-atomic: the selection is expanded through the shard model, and if any
+    member's archive file is missing on the mount we refuse rather than write a
+    partial (half-copied) set.
+    """
+    import shutil
+
+    archive_dir, m = _load_plan_manifest(plan)
+    if args.export_cycle:
+        cid = args.export_cycle
+        cyc = next((c for c in manifestlib.cycles(m) if c.cycle_id == cid), None)
+        if cyc is None:
+            print(f"export-cycle: no cycle {cid!r} in plan {plan.plan_name!r}",
+                  file=sys.stderr)
+            return 1
+        sets = ([cyc.full_set] if cyc.full_set else []) + cyc.incr_sets
+        label = f"cycle {cid}"
+    else:
+        gid = args.export_set
+        s = next((s for s in manifestlib.shard_sets(m) if s.group_id == gid), None)
+        if s is None:
+            print(f"export-set: no backup {gid!r} in plan {plan.plan_name!r}",
+                  file=sys.stderr)
+            return 1
+        sets = [s]
+        label = f"backup {gid}"
+
+    members = [a for s in sets for a in s.members]
+    if not members:
+        print(f"export: {label} has no archives.", file=sys.stderr)
+        return 1
+
+    # Refuse a partial bundle: every member must have a primary archive on disk
+    # (bare or `.failed`). Missing one means the source set is already broken.
+    plan_files: list[tuple] = []
+    for a in members:
+        files = _member_files(archive_dir, a.filename)
+        has_primary = any(p.name == a.filename
+                          or p.name == a.filename + ".failed" for p in files)
+        if not has_primary:
+            print(f"export: {label} is incomplete — {a.filename} is missing on "
+                  f"the mount; refusing to write a partial bundle.",
+                  file=sys.stderr)
+            return 1
+        plan_files.append((a, files))
+
+    into = Path(args.into) if args.into is not None else Path.cwd()
+    try:
+        into.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"export: cannot create {into}: {e}", file=sys.stderr)
+        return 1
+
+    copied = 0
+    for _a, files in plan_files:
+        for p in files:
+            try:
+                shutil.copy2(p, into / p.name)
+                copied += 1
+            except OSError as e:
+                print(f"export: failed to copy {p.name}: {e}", file=sys.stderr)
+                return 1
+
+    # Manifest slice describing exactly the exported entries, so the bundle is
+    # self-contained (and --refresh-from-mount in the target finds it).
+    slice_man = manifestlib.Manifest(plan_name=plan.plan_name, archives=members)
+    manifestlib.save(slice_man, manifestlib.manifest_path(into))
+    _log(args, f"export: copied {label} ({len(members)} shard(s), {copied} file(s)) "
+               f"into {into}")
     return 0
 
 
@@ -1659,6 +1781,8 @@ def main(argv: list[str] | None = None) -> int:
         return action_delete_cycle(args, plan)
     if args.delete_set:
         return action_delete_set(args, plan)
+    if args.export_cycle or args.export_set:
+        return action_export(args, plan)
     if args.remove_plan:
         return action_remove_plan(args, plan)
     if args.switch_to_archive:
