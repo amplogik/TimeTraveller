@@ -82,6 +82,10 @@ def _seed_failed(tmp_path: Path, *, framed: bool = True,
     fname = "2026-06-13_incr.pax.zst"
 
     built = _build_archive(archive_dir, tmp_path / "src", fname, framed=framed)
+    # A genuinely failed backup never produced a sidecar index (the post-write /
+    # inline build is skipped on failure); drop the one the successful build
+    # just created so the fixture matches a real .failed state.
+    indexlib.sidecar_path(built).unlink(missing_ok=True)
     if not already_bare:
         built.rename(built.with_suffix(built.suffix + ".failed"))
 

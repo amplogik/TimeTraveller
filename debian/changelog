@@ -1,3 +1,24 @@
+timetraveller (1.0.7) unstable; urgency=medium
+
+  * Inline index build: framed backups now build the .idx.zst sidecar
+    during the archive write instead of in a second pass that re-read and
+    re-decompressed the whole archive afterward. On the NFS target that
+    second pass was ~23% of wall time (~28 min on the 753 GiB home full,
+    bound by the NFS read of the just-written archive); folding it into
+    the write eliminates that read entirely. A background InlineIndexWriter
+    is fed the uncompressed tar stream the framewriter already consumes and
+    emits the identical v2 JSONL records, so the on-disk format and all
+    sidecar/extract readers are unchanged (validated byte-identical to the
+    post-write build, including long-name/symlink/hardlink entries, and
+    against a real fast single-file extract).
+  * Fallbacks preserved: --no-framed keeps the post-write index pass, any
+    inline-build failure degrades to that same pass rather than failing the
+    backup, and --reindex remains the repair path for old or missing
+    sidecars. The backup's worst case is unchanged; the common framed path
+    drops the second archive read.
+
+ -- Kim McCann <amplogik@gmail.com>  Sat, 13 Jun 2026 06:38:36 -0700
+
 timetraveller (1.0.6) unstable; urgency=medium
 
   * New --recover-failed action: un-quarantine a backup marked 'failed'

@@ -68,11 +68,19 @@ def write_framed(
     zstd_level: int = 3,
     frame_size: int = FRAME_SIZE,
     flush_every: int = FLUSH_EVERY,
+    index_writer=None,
 ) -> dict:
     """Stream `input_stream` to `archive_path` as a series of independent zstd
     frames; emit `<archive_path>.frames.json` alongside on clean exit.
 
-    Returns the final frame-index dict.
+    Returns the final frame-index dict, plus `index_built` (True iff an inline
+    sidecar index was requested and written cleanly).
+
+    If `index_writer` (an index.InlineIndexWriter) is given, each uncompressed
+    chunk is tee'd to it so the `.idx.zst` sidecar is built in this same pass —
+    no post-write re-read. The archive write is authoritative: an inline-index
+    failure is reported via `index_built=False` (caller falls back to the
+    post-write `write_sidecar`), never raised.
 
     On a mid-run crash, the partial sidecar at `<archive_path>.frames.json.partial`
     holds the index up to the last flush boundary. Callers can detect this by
@@ -101,30 +109,51 @@ def write_framed(
             "frames": frames,
         }
 
-    with open(archive_path, "wb") as out:
-        while True:
-            chunk = _read_full(input_stream, frame_size)
-            if not chunk:
-                break
-            compressed = compressor.compress(chunk)
+    if index_writer is not None:
+        index_writer.start()
+    index_built = False
+    try:
+        with open(archive_path, "wb") as out:
+            while True:
+                chunk = _read_full(input_stream, frame_size)
+                if not chunk:
+                    break
+                compressed = compressor.compress(chunk)
 
-            frames.append({
-                "id": len(frames),
-                "uo": total_uncompressed,
-                "ul": len(chunk),
-                "co": total_compressed,
-                "cl": len(compressed),
-            })
+                frames.append({
+                    "id": len(frames),
+                    "uo": total_uncompressed,
+                    "ul": len(chunk),
+                    "co": total_compressed,
+                    "cl": len(compressed),
+                })
 
-            out.write(compressed)
-            total_uncompressed += len(chunk)
-            total_compressed += len(compressed)
+                out.write(compressed)
+                total_uncompressed += len(chunk)
+                total_compressed += len(compressed)
 
-            if len(frames) % flush_every == 0:
-                _atomic_write_json(partial_path, snapshot())
+                if index_writer is not None:
+                    index_writer.feed(chunk)
 
-        out.flush()
-        os.fsync(out.fileno())
+                if len(frames) % flush_every == 0:
+                    _atomic_write_json(partial_path, snapshot())
+
+            out.flush()
+            os.fsync(out.fileno())
+
+        # Archive bytes are committed; finalize the inline index off the same
+        # stream. A failure here is non-fatal — the caller re-reads instead.
+        if index_writer is not None:
+            index_built = index_writer.finish()
+    except BaseException:
+        # Archive write failed; unblock + join the index thread so it doesn't
+        # leak, without masking the original error.
+        if index_writer is not None:
+            try:
+                index_writer.abort()
+            except Exception:
+                pass
+        raise
 
     final = snapshot()
     _atomic_write_json(final_path, final)
@@ -134,7 +163,11 @@ def write_framed(
     except FileNotFoundError:
         pass
 
-    return final
+    # `index_built` is returned to the caller but deliberately NOT written into
+    # the on-disk frames.json, whose schema stays at version 1.
+    result = dict(final)
+    result["index_built"] = index_built
+    return result
 
 
 def _read_full(stream: BinaryIO, n: int) -> bytes:

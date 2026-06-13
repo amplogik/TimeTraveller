@@ -1327,17 +1327,26 @@ def action_backup(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
         print(f"WARNING: pax={result.pax_returncode} (non-fatal — archive is trustworthy); "
               f"see {log_path}", file=sys.stderr)
 
-    _log(args, f"Archive written: {result.archive_size/1024**2:.1f} MiB "
-               f"in {_hms(result.duration_seconds)} (sidecar pending)")
-
     has_sidecar = False
-    try:
-        indexlib.write_sidecar(archive_path)
+    if result.index_built and indexlib.sidecar_path(archive_path).exists():
+        # Framed run already built the .idx.zst inline off the write stream —
+        # no second pass over the archive (the win on the NFS target).
         has_sidecar = True
-        _log(args, "Sidecar index written.")
+        _log(args, f"Archive written: {result.archive_size/1024**2:.1f} MiB "
+                   f"in {_hms(result.duration_seconds)} (sidecar built inline)")
         _mirror_sidecar(plan.plan_name, indexlib.sidecar_path(archive_path), fname)
-    except Exception as e:  # noqa: BLE001 - sidecar failure shouldn't fail the backup
-        print(f"WARNING: sidecar generation failed: {e}", file=sys.stderr)
+    else:
+        # --no-framed runs, or an inline-index failure: fall back to the
+        # post-write re-read pass.
+        _log(args, f"Archive written: {result.archive_size/1024**2:.1f} MiB "
+                   f"in {_hms(result.duration_seconds)} (sidecar pending)")
+        try:
+            indexlib.write_sidecar(archive_path)
+            has_sidecar = True
+            _log(args, "Sidecar index written.")
+            _mirror_sidecar(plan.plan_name, indexlib.sidecar_path(archive_path), fname)
+        except Exception as e:  # noqa: BLE001 - sidecar failure shouldn't fail the backup
+            print(f"WARNING: sidecar generation failed: {e}", file=sys.stderr)
 
     if not args.no_retention:
         prune_args = argparse.Namespace(**vars(args))

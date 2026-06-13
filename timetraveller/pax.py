@@ -17,6 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import framewriter
+from . import index as indexlib
 
 
 def glob_to_regexes(pattern: str) -> list[str]:
@@ -396,6 +397,7 @@ class RunResult:
     file_count: int = 0   # only meaningful for run_with_file_list
     frame_count: int = 0  # only meaningful when framed=True; 0 means unframed
     pax_stderr: str | None = None  # captured tar/pax stderr; None if uncaptured
+    index_built: bool = False  # True iff the .idx.zst sidecar was built inline
 
     @property
     def status(self) -> str:
@@ -525,13 +527,19 @@ def run_with_file_list(invocation: PaxInvocation, file_iter,
         frame_box: dict = {}
         ft: threading.Thread | None = None
         zstd: subprocess.Popen | None = None
+        index_writer = None
         if invocation.framed:
             # Background thread reads pax.stdout, compresses 64 MiB at a time
-            # as independent zstd frames, writes archive + .frames.json sidecar.
+            # as independent zstd frames, writes archive + .frames.json sidecar,
+            # and (via index_writer) builds the .idx.zst sidecar inline off the
+            # same uncompressed stream — no post-write re-read.
+            index_writer = indexlib.InlineIndexWriter(invocation.archive_path)
+
             def _frame_thread():
                 try:
                     frame_box["result"] = framewriter.write_framed(
-                        pax.stdout, invocation.archive_path
+                        pax.stdout, invocation.archive_path,
+                        index_writer=index_writer,
                     )
                 except BaseException as exc:  # propagate to main thread
                     frame_box["error"] = exc
@@ -565,6 +573,7 @@ def run_with_file_list(invocation: PaxInvocation, file_iter,
             if "error" in frame_box:
                 raise frame_box["error"]
             frame_count = frame_box["result"]["frame_count"]
+            index_built = frame_box["result"].get("index_built", False)
             zstd_rc = 0
         else:
             assert zstd is not None
@@ -572,6 +581,7 @@ def run_with_file_list(invocation: PaxInvocation, file_iter,
             pax_rc = pax.wait()
             capture.join()
             frame_count = 0
+            index_built = False
     finally:
         if log_fp:
             if n > 0:
@@ -590,6 +600,7 @@ def run_with_file_list(invocation: PaxInvocation, file_iter,
         duration_seconds=duration,
         file_count=n,
         frame_count=frame_count,
+        index_built=index_built,
     )
 
 

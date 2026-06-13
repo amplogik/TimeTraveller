@@ -25,11 +25,14 @@ the first non-whitespace character — v2 always starts with `{`.
 
 from __future__ import annotations
 
+import io
 import json
 import os
+import queue
 import shutil
 import subprocess
 import tarfile
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -164,6 +167,138 @@ def write_sidecar(archive_path: Path) -> Path:
 
     os.replace(tmp, sidecar)
     return sidecar
+
+
+_INDEX_SENTINEL = object()
+_INDEX_QUEUE_MAXSIZE = 4  # bounded: ~4*64 MiB buffered if indexing falls behind
+
+
+class _QueueReader(io.RawIOBase):
+    """Raw file-like over a queue of *uncompressed* tar byte chunks.
+
+    Wrapped in an io.BufferedReader by InlineIndexWriter so tarfile's many
+    small reads hit the C buffer rather than incurring Python per-read
+    overhead. Holds a partially-consumed chunk as a memoryview — no growing
+    accumulator, no repeated big-buffer slicing (the shape validated fastest
+    in prototype/inline_index.py).
+    """
+
+    def __init__(self, q: queue.Queue) -> None:
+        super().__init__()
+        self._q = q
+        self._cur = memoryview(b"")
+        self._eof = False
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b) -> int:
+        if not len(self._cur) and not self._eof:
+            chunk = self._q.get()
+            if chunk is _INDEX_SENTINEL:
+                self._eof = True
+            else:
+                self._cur = memoryview(chunk)
+        if not len(self._cur):
+            return 0
+        n = min(len(b), len(self._cur))
+        b[:n] = self._cur[:n]
+        self._cur = self._cur[n:]
+        return n
+
+
+class InlineIndexWriter:
+    """Builds `<archive>.idx.zst` from the uncompressed tar byte stream *as it
+    is produced*, in a background thread fed via `feed()`.
+
+    This is the inline counterpart to `write_sidecar`: it emits the identical
+    v2 JSONL records (validated for byte-identity in
+    prototype/inline_index.py), so `archive.parse_index` / `extract.py` readers
+    are unchanged — but it consumes the bytes the framewriter already has in
+    hand during the write, eliminating the post-write re-read + re-decompress
+    pass (the bulk of which is an NFS read on this tool's target).
+
+    Crash-safety mirrors `write_sidecar`: records stream into a `.tmp` that is
+    atomically renamed only on a clean finish; the partial `.tmp` is removed on
+    error and `--reindex` remains the rebuild path.
+
+    Producer usage:
+        idx = InlineIndexWriter(archive_path); idx.start()
+        for chunk in uncompressed_stream: idx.feed(chunk)
+        ok = idx.finish()       # True iff the sidecar was written cleanly
+    On a producer-side abort (pax died, archive write error), call `abort()`
+    instead of `finish()` to unblock + join the thread without surfacing a
+    secondary error.
+    """
+
+    def __init__(self, archive_path: Path, *, maxsize: int = _INDEX_QUEUE_MAXSIZE):
+        self.archive_path = archive_path
+        self._q: queue.Queue = queue.Queue(maxsize=maxsize)
+        self._thread: threading.Thread | None = None
+        self._error: BaseException | None = None
+        self.records = 0
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, daemon=False)
+        self._thread.start()
+
+    def feed(self, chunk: bytes) -> None:
+        self._q.put(chunk)
+
+    def finish(self) -> bool:
+        """Signal EOF, join the builder, and report whether it succeeded."""
+        self._q.put(_INDEX_SENTINEL)
+        if self._thread is not None:
+            self._thread.join()
+        return self._error is None
+
+    def abort(self) -> None:
+        """Unblock + join the builder without raising (the producer failed)."""
+        self._q.put(_INDEX_SENTINEL)
+        if self._thread is not None:
+            self._thread.join()
+
+    @property
+    def error(self) -> BaseException | None:
+        return self._error
+
+    def _drain(self) -> None:
+        """Discard queued chunks until the sentinel, so a producer still
+        feeding a bounded (now-full) queue after we've bailed doesn't block."""
+        while self._q.get() is not _INDEX_SENTINEL:
+            pass
+
+    def _run(self) -> None:
+        sidecar = sidecar_path(self.archive_path)
+        tmp = sidecar.with_suffix(sidecar.suffix + ".tmp")
+        header = {
+            "version": SIDECAR_VERSION,
+            "archive": self.archive_path.name,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        cctx = zstd.ZstdCompressor(level=3)
+        try:
+            sidecar.parent.mkdir(parents=True, exist_ok=True)
+            reader = io.BufferedReader(_QueueReader(self._q), buffer_size=1 << 20)
+            n = 0
+            with open(tmp, "wb") as raw_out:
+                with cctx.stream_writer(raw_out) as zstd_out:
+                    zstd_out.write((json.dumps(header) + "\n").encode())
+                    with tarfile.open(fileobj=reader, mode="r|") as tf:
+                        for ti in tf:
+                            zstd_out.write((json.dumps(_tarinfo_to_record(ti)) + "\n").encode())
+                            n += 1
+            os.replace(tmp, sidecar)
+            self.records = n
+        except BaseException as exc:  # noqa: BLE001 - any failure -> fall back to re-read
+            self._error = exc
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            # The producer may still be feeding a full bounded queue; drain it
+            # so feed() doesn't deadlock now that we've stopped consuming.
+            self._drain()
 
 
 def read_sidecar(sidecar: Path) -> list[str]:
