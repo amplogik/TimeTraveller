@@ -331,6 +331,26 @@ class PlanPanel(QWidget):
             ml.addWidget(w)
         layout.addRow(mnt_box)
 
+        # Parallelism (sharding). Splits each backup into N concurrent write
+        # streams for throughput; the set restores/retains as one logical backup.
+        perf_box = QGroupBox("Parallelism")
+        pl = QFormLayout(perf_box)
+        perf_note = QLabel(
+            "<i>Split each backup into parallel write streams (shards). Each "
+            "shard is its own archive written concurrently; restore and "
+            "retention treat the set as one backup. The effective count is "
+            "capped by the backup's size so small backups don't fan out.</i>"
+        )
+        perf_note.setWordWrap(True)
+        pl.addRow(perf_note)
+        self._shards_auto = QCheckBox("Auto (scale to CPU cores)")
+        self._shards_count = QSpinBox()
+        self._shards_count.setRange(1, 64)
+        self._shards_count.setSuffix(" streams")
+        pl.addRow("", self._shards_auto)
+        pl.addRow("Write streams:", self._shards_count)
+        layout.addRow(perf_box)
+
         # Wire change signals.
         self._dest.textEdited.connect(self.changed.emit)
         self._dest_browse.clicked.connect(self._on_browse)
@@ -342,6 +362,8 @@ class PlanPanel(QWidget):
         self._include_removable.toggled.connect(self.changed.emit)
         self._include_nfs.toggled.connect(self.changed.emit)
         self._include_cifs.toggled.connect(self.changed.emit)
+        self._shards_auto.toggled.connect(self._on_shards_auto_toggled)
+        self._shards_count.valueChanged.connect(self.changed.emit)
         self._sources.changed.connect(self.changed.emit)
         self._sources.changed.connect(self._on_sources_edited)
         self._excludes.changed.connect(self.changed.emit)
@@ -379,6 +401,12 @@ class PlanPanel(QWidget):
         self._include_removable.setChecked(bool(plan.include_removable))
         self._include_nfs.setChecked(bool(plan.include_nfs))
         self._include_cifs.setChecked(bool(plan.include_cifs))
+        is_auto = plan.shards == "auto"
+        self._shards_auto.setChecked(is_auto)
+        # When auto, show the resolved count (read-only) so the user can see what
+        # "auto" picks on this machine; otherwise show the explicit setting.
+        self._shards_count.setValue(plan.configured_shards())
+        self._update_shards_enabled()
         self._update_retention_enabled()
 
     def to_plan(self) -> PlanConfig:
@@ -405,6 +433,7 @@ class PlanPanel(QWidget):
             include_removable=self._include_removable.isChecked(),
             include_nfs=self._include_nfs.isChecked(),
             include_cifs=self._include_cifs.isChecked(),
+            shards="auto" if self._shards_auto.isChecked() else self._shards_count.value(),
         )
 
     def _on_browse(self) -> None:
@@ -413,6 +442,19 @@ class PlanPanel(QWidget):
         if d:
             self._dest.setText(d)
             self.changed.emit()
+
+    def _on_shards_auto_toggled(self, checked: bool) -> None:
+        # Re-resolve the displayed count when flipping back to auto so the spinbox
+        # reflects the machine default rather than a stale explicit value.
+        if checked and self._plan is not None:
+            self._shards_count.setValue(replace(self._plan, shards="auto").configured_shards())
+        self._update_shards_enabled()
+        self.changed.emit()
+
+    def _update_shards_enabled(self) -> None:
+        # The count is editable only when auto is off; when on it's a read-only
+        # display of the resolved default.
+        self._shards_count.setEnabled(not self._shards_auto.isChecked())
 
     def _on_policy_changed(self, _value: str) -> None:
         self._update_retention_enabled()

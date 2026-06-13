@@ -1,3 +1,15 @@
+timetraveller (1.1.2) unstable; urgency=medium
+
+  * GUI: the plan editor now exposes a "Parallelism" control for sharding.
+    "Auto (scale to CPU cores)" maps to the existing shards="auto" default and
+    displays the resolved per-machine count read-only; unticking it reveals a
+    "Write streams" spinbox (1-64) for an explicit count. Surfaces the existing
+    shards config field; no schema or write-path change. The editor shows the
+    *configured* count only -- the effective count is capped by backup size at
+    run time, as before.
+
+ -- Kim McCann <amplogik@gmail.com>  Sat, 13 Jun 2026 13:55:49 -0700
+
 timetraveller (1.1.1) unstable; urgency=medium
 
   * GUI: a sharded backup now shows as ONE logical-backup row ("full
