@@ -182,9 +182,7 @@ class ArchivePanel(QWidget):
         listing = list_from_manifest(self._plan.plan_name, self._plan.archive_dir())
         all_entries: list[ArchiveEntry] = []
         for c in listing.cycles:
-            if c.full is not None:
-                all_entries.append(c.full)
-            all_entries.extend(c.incrementals)
+            all_entries.extend(c.archives)   # every shard, so all are searchable
         self._search_widget.set_plan(self._plan.plan_name, all_entries)
         if not listing.cycles:
             placeholder = QTreeWidgetItem([
@@ -208,10 +206,9 @@ class ArchivePanel(QWidget):
             top.setForeground(0, _color("#cc8000"))
         self._archive_list.addTopLevelItem(top)
 
-        members: list = []
-        if cycle.full is not None:
-            members.append(cycle.full)
-        members.extend(cycle.incrementals)
+        # All shard entries (a sharded full lists every shard, not just the
+        # representative). Ordered: full shards first, then incrementals.
+        members = list(cycle.archives)
         for entry in members:
             size_str = _human(entry.size_bytes)
             status_str = entry.status

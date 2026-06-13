@@ -102,6 +102,28 @@ def test_sharded_full_through_action_backup(tmp_path, monkeypatch):
     assert _sha(out / target[2:]) == _sha(Path("/") / target[2:])
 
 
+def test_cli_extract_across_shards(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(worker, "_MIN_SHARD_BYTES", 1)
+    src = tmp_path / "src"
+    _make_tree(src)
+    plan = _plan(tmp_path / "dest", src, shards=3)
+    assert worker.action_backup(_args("full"), plan) == 0
+
+    man = manifestlib.load(manifestlib.manifest_path(plan.archive_dir()))
+    stem = manifestlib.shard_sets(man)[0].group_id   # e.g. "<date>_full"
+
+    out = tmp_path / "restore"
+    subtree = "./" + str(src).lstrip("/") + "/"      # spans all shards
+    eargs = argparse.Namespace(extract=stem, paths=[subtree], into=out, quiet=True)
+    assert worker.action_extract(eargs, plan) == 0
+
+    restored = list(out.rglob("f*.txt"))
+    assert len(restored) == 20                       # every file, gathered from all shards
+    for r in restored:
+        assert _sha(r) == _sha(Path("/") / r.relative_to(out))
+
+
 def test_unsharded_full_is_legacy_single_archive(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     monkeypatch.setattr(worker, "_MIN_SHARD_BYTES", 1)

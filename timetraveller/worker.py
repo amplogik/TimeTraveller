@@ -749,39 +749,82 @@ def action_recover_failed(args: argparse.Namespace, plan: configlib.PlanConfig) 
     return 0
 
 
+def _resolve_extract_targets(archive_dir: Path, identifier: str) -> list[Path]:
+    """Map an --extract identifier to the archive file(s) to read.
+
+    `identifier` may be a shard-group stem (`2026-06-13_full`), a plain archive
+    filename, or one shard's filename — all resolve to the whole logical
+    backup's shards (a member lives in exactly one shard, so we extract from
+    every present shard). Falls back to treating the identifier as a literal
+    filename when the manifest has no matching entries.
+    """
+    group = manifestlib._group_id_from_filename(identifier)
+    try:
+        m = manifestlib.load(manifestlib.manifest_path(archive_dir))
+    except (OSError, ValueError):
+        m = None
+    if m is not None:
+        files = [archive_dir / e.filename for e in m.archives
+                 if manifestlib.group_id_for(e) == group
+                 and (archive_dir / e.filename).exists()]
+        if files:
+            return sorted(files)
+    # Literal-filename fallback (also covers manifest-less archive dirs).
+    p = archive_dir / identifier
+    return [p] if p.exists() else []
+
+
 def action_extract(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
-    archive = plan.archive_dir() / args.extract
-    if not archive.exists():
-        print(f"archive not found: {archive}", file=sys.stderr)
-        return 1
     if not args.paths:
         print("--extract: at least one path argument is required.\n"
               "  Examples:\n"
-              "    --extract ARCHIVE ./etc/fstab           # single file\n"
-              "    --extract ARCHIVE ./etc/                # subtree\n"
-              "    --extract ARCHIVE --into /tmp/r ./var/log/syslog",
+              "    --extract BACKUP ./etc/fstab            # single file\n"
+              "    --extract BACKUP ./etc/                 # subtree\n"
+              "    --extract BACKUP --into /tmp/r ./var/log/syslog\n"
+              "  BACKUP is an archive name or a sharded backup's stem "
+              "(e.g. 2026-06-13_full).",
               file=sys.stderr)
+        return 1
+    archive_dir = plan.archive_dir()
+    shards = _resolve_extract_targets(archive_dir, args.extract)
+    if not shards:
+        print(f"archive not found: {archive_dir / args.extract}", file=sys.stderr)
         return 1
     into = args.into if args.into is not None else Path.cwd()
 
-    stats = extractlib.extract_files(archive, list(args.paths), into=into)
+    # Extract the requested paths from every shard and sum the results. Each
+    # member lives in exactly one shard, so there's no overlap to de-dup; a
+    # shard that holds none of the requested paths simply contributes nothing.
+    files = dirs = syms = hards = frames = nfs_bytes = written = 0
+    seconds = 0.0
+    any_naive = False
+    for shard in shards:
+        st = extractlib.extract_files(shard, list(args.paths), into=into)
+        files += st.matched_files
+        dirs += st.matched_dirs
+        syms += st.matched_symlinks
+        hards += st.matched_hardlinks
+        frames += st.frames_read
+        nfs_bytes += st.nfs_bytes_read
+        written += st.bytes_written
+        seconds += st.seconds_total
+        any_naive = any_naive or st.fallback_naive
 
-    if stats.matched_files + stats.matched_dirs + stats.matched_symlinks == 0:
-        print(f"--extract: no matching entries in {archive.name}", file=sys.stderr)
+    if files + dirs + syms == 0:
+        where = (f"{len(shards)} shard(s) of {args.extract}" if len(shards) > 1
+                 else args.extract)
+        print(f"--extract: no matching entries in {where}", file=sys.stderr)
         return 1
 
-    mode = "naive (whole-archive scan)" if stats.fallback_naive else "fast (sidecar-based)"
-    _log(args, f"--extract mode: {mode}")
-    _log(args, f"  patterns: {stats.requested_patterns}, "
-               f"files: {stats.matched_files}, dirs: {stats.matched_dirs}, "
-               f"symlinks: {stats.matched_symlinks}"
-               + (f", hardlinks skipped: {stats.matched_hardlinks}"
-                  if stats.matched_hardlinks else ""))
-    if not stats.fallback_naive:
-        _log(args, f"  frames read: {stats.frames_read} "
-                   f"({stats.nfs_bytes_read/1024**2:.1f} MiB from archive)")
-    _log(args, f"  bytes written: {stats.bytes_written:,}")
-    _log(args, f"  elapsed: {_hms(stats.seconds_total)}")
+    scope = f"{len(shards)} shards" if len(shards) > 1 else "1 archive"
+    mode = "naive (whole-archive scan)" if any_naive else "fast (sidecar-based)"
+    _log(args, f"--extract from {scope}; mode: {mode}")
+    _log(args, f"  files: {files}, dirs: {dirs}, symlinks: {syms}"
+               + (f", hardlinks skipped: {hards}" if hards else ""))
+    if not any_naive:
+        _log(args, f"  frames read: {frames} ({nfs_bytes/1024**2:.1f} MiB from archives)")
+    _log(args, f"  bytes written: {written:,}")
+    _log(args, f"  elapsed: {_hms(seconds)}")
     return 0
 
 

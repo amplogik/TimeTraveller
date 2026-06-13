@@ -272,10 +272,9 @@ class CycleListing:
     is_complete: bool
     full: manifestlib.ArchiveEntry | None
     incrementals: list[manifestlib.ArchiveEntry]
-
-    @property
-    def archives(self) -> list[manifestlib.ArchiveEntry]:
-        return ([self.full] if self.full else []) + self.incrementals
+    # ALL archive entries in the cycle, including every shard of a sharded full
+    # (which `full` — the representative shard — and `incrementals` don't list).
+    archives: list[manifestlib.ArchiveEntry] = field(default_factory=list)
 
     @property
     def total_size(self) -> int:
@@ -298,6 +297,7 @@ def _build_listing(manifest_path: Path, plan_name_fallback: str,
             is_complete=c.is_complete,
             full=c.full,
             incrementals=list(c.incrementals),
+            archives=list(c.archives),   # all shards, not just the representative
         ))
     return ArchiveListing(
         plan_name=m.plan_name or plan_name_fallback,
@@ -364,6 +364,7 @@ def list_for_plan(archive_dir: Path) -> ArchiveListing:
             is_complete=False,
             full=None,
             incrementals=[entry],
+            archives=[entry],
         ))
     return listing
 
