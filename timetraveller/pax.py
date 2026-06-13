@@ -177,8 +177,13 @@ def iter_archivable_files(sources: list[str], excludes_re: list[str],
                           mtime_window: tuple[datetime, datetime] | None = None,
                           include_dirs: bool = True,
                           one_filesystem: bool = True,
-                          skip_special: bool = True):
+                          skip_special: bool = True,
+                          yield_size: bool = False):
     """Yield relative archive-member paths under `sources` to feed to pax.
+
+    With `yield_size=True`, yield `(member, size_bytes)` tuples instead of bare
+    paths — used by the sharded write path to size-balance the partition without
+    a second stat pass (the size comes from the lstat the walk already does).
 
     The walk is the single source of truth for both fulls and incrementals:
 
@@ -214,6 +219,9 @@ def iter_archivable_files(sources: list[str], excludes_re: list[str],
     def in_window(mt: float) -> bool:
         return mtime_window is None or (frm_ts < mt <= to_ts)
 
+    def emit(rel: str, st):
+        return (rel, st.st_size) if yield_size else rel
+
     for source in sources:
         try:
             sroot = os.path.realpath(source)
@@ -227,7 +235,7 @@ def iter_archivable_files(sources: list[str], excludes_re: list[str],
             root_st = os.lstat(sroot)
             rel_root = "./" + os.path.relpath(sroot, "/")
             if include_dirs and not is_excluded(rel_root) and in_window(root_st.st_mtime):
-                yield rel_root
+                yield emit(rel_root, root_st)
         except OSError:
             pass
 
@@ -248,7 +256,7 @@ def iter_archivable_files(sources: list[str], excludes_re: list[str],
                     continue
                 new_dirs.append(d)
                 if include_dirs and in_window(st.st_mtime):
-                    yield rel
+                    yield emit(rel, st)
             dirs[:] = sorted(new_dirs)
 
             for f in sorted(files):
@@ -268,7 +276,7 @@ def iter_archivable_files(sources: list[str], excludes_re: list[str],
                     continue
                 if not in_window(st.st_mtime):
                     continue
-                yield rel
+                yield emit(rel, st)
 
 
 def list_changes_in_window(sources, excludes_re, extra_excludes, frm, to,
@@ -610,27 +618,51 @@ run_incremental = run_with_file_list
 
 # ---------- archive naming ----------
 
-_NAME_RE = re.compile(r"^(?P<date>\d{4}-\d{2}-\d{2}(?:T\d{6})?)_(?P<kind>full|incr)\.pax\.zst$")
+_NAME_RE = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2}(?:T\d{6})?)_(?P<kind>full|incr)"
+    r"(?:\.s\d+of\d+)?\.pax\.zst$")
 
 
-def archive_filename(*, dt: datetime, kind: str, manual: bool = False) -> str:
+def archive_filename(*, dt: datetime, kind: str, manual: bool = False,
+                     shard_index: int = 1, shard_count: int = 1) -> str:
     """Compute the archive filename per the naming convention.
 
     Scheduled runs use date only (YYYY-MM-DD). Manual runs include the time
     component (YYYY-MM-DDTHHMMSS) so multiple runs in one day don't collide.
+    Sharded backups (shard_count>1) append `.s{index}of{count}`; an unsharded
+    backup keeps the historical `{stem}.pax.zst` name unchanged.
     """
     if kind not in ("full", "incr"):
         raise ValueError(f"kind must be full|incr, got {kind!r}")
-    if manual:
-        ts = dt.strftime("%Y-%m-%dT%H%M%S")
-    else:
-        ts = dt.strftime("%Y-%m-%d")
-    return f"{ts}_{kind}.pax.zst"
+    ts = dt.strftime("%Y-%m-%dT%H%M%S") if manual else dt.strftime("%Y-%m-%d")
+    stem = f"{ts}_{kind}"
+    if shard_count > 1:
+        return f"{stem}.s{shard_index}of{shard_count}.pax.zst"
+    return f"{stem}.pax.zst"
 
 
 def parse_filename(name: str) -> tuple[str, str] | None:
-    """Inverse of archive_filename: return (date_str, kind) or None."""
+    """Inverse of archive_filename: return (date_str, kind) or None.
+
+    Tolerates the optional `.s{i}of{N}` shard suffix; shard membership is not
+    returned here (the manifest carries it).
+    """
     m = _NAME_RE.match(name)
     if not m:
         return None
     return m.group("date"), m.group("kind")
+
+
+def partition_by_size(items: list, n: int) -> list[list[str]]:
+    """Greedy size-balanced partition of (member, size) pairs into n bins.
+
+    Returns n lists of member paths. Largest-first bin-packing keeps the bins'
+    total bytes close — the unit that matters for parallel write wall-time.
+    """
+    bins: list[list[str]] = [[] for _ in range(n)]
+    loads = [0] * n
+    for size, member in sorted(((s, r) for r, s in items), reverse=True):
+        i = loads.index(min(loads))
+        bins[i].append(member)
+        loads[i] += size
+    return bins

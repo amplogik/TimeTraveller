@@ -10,6 +10,7 @@ import argparse
 import os
 import socket
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -320,6 +321,81 @@ def _mirror_sidecar(plan_name: str, source_sidecar: Path,
         indexlib.copy_sidecar_to_mirror(plan_name, source_sidecar, archive_filename)
     except OSError as e:
         print(f"WARNING: sidecar mirror copy failed: {e}", file=sys.stderr)
+
+
+# Below this total, a backup runs as a single stream — parallelism overhead
+# isn't worth it, and we don't want to spawn near-empty shards. Also the
+# per-shard target: roughly one shard per ~1 GiB of (uncompressed) data.
+_MIN_SHARD_BYTES = 1 << 30
+
+
+def _member_size(member: str) -> int:
+    """Size of an archive member (path is './<rel-to-/>'). 0 if unstat-able."""
+    try:
+        return os.lstat("/" + member[2:]).st_size
+    except OSError:
+        return 0
+
+
+def _effective_shards(configured: int, work: list) -> int:
+    """Cap the configured shard count by the backup's size and file count so a
+    small backup (or a tiny incremental) doesn't fan out into empty shards."""
+    if configured <= 1 or not work:
+        return 1
+    total = sum(sz for _m, sz in work)
+    return max(1, min(configured, total // _MIN_SHARD_BYTES, len(work)))
+
+
+def _finalize_one(m: manifestlib.Manifest, archive_path: Path, fname: str,
+                  result, plan: configlib.PlanConfig, args: argparse.Namespace,
+                  log_path: Path) -> str:
+    """Post-run handling for ONE archive (shard or whole backup): mirror/build
+    the sidecar, rename to .failed on failure, and update the manifest entry.
+    Returns the archive's status. Does not prune or save the manifest — the
+    caller does that once all shards are finalized."""
+    status = result.status
+    if status == "failed":
+        m.update_status(fname, status=status,
+                        date_finished=datetime.now(timezone.utc).isoformat(),
+                        size_bytes=result.archive_size)
+        print(f"ERROR: {fname}: pax={result.pax_returncode} "
+              f"zstd={result.zstd_returncode}; see {log_path}", file=sys.stderr)
+        try:
+            archive_path.rename(archive_path.with_suffix(archive_path.suffix + ".failed"))
+        except OSError:
+            pass
+        return status
+
+    if status == "ok-with-warnings":
+        print(f"WARNING: {fname}: pax={result.pax_returncode} (non-fatal — "
+              f"archive is trustworthy); see {log_path}", file=sys.stderr)
+
+    has_sidecar = False
+    sc = indexlib.sidecar_path(archive_path)
+    if result.index_built and sc.exists():
+        has_sidecar = True
+        _mirror_sidecar(plan.plan_name, sc, fname)
+    else:
+        try:
+            indexlib.write_sidecar(archive_path)
+            has_sidecar = True
+            _mirror_sidecar(plan.plan_name, sc, fname)
+        except Exception as e:  # noqa: BLE001 - sidecar failure shouldn't fail the backup
+            print(f"WARNING: {fname}: sidecar generation failed: {e}", file=sys.stderr)
+
+    m.update_status(fname, status=status,
+                    date_finished=datetime.now(timezone.utc).isoformat(),
+                    size_bytes=result.archive_size)
+    for entry in m.archives:
+        if entry.filename == fname:
+            if result.frame_count > 0:
+                entry.has_frames = True
+            if has_sidecar:
+                entry.has_sidecar = True
+            break
+    _log(args, f"  {fname}: {result.archive_size/1024**2:.1f} MiB"
+               + ("  (sidecar built inline)" if result.index_built else ""))
+    return status
 
 
 # ---------- action handlers ----------
@@ -1247,130 +1323,98 @@ def action_backup(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
               "will require a full archive read (can be many hours on large archives).",
               file=sys.stderr)
 
-    inv = paxlib.PaxInvocation(
-        sources=sources_rel,
-        chdir=chdir,
-        archive_path=archive_path,
-        excludes=plan.excludes,
-        extra_mount_excludes=report.additional_excludes,
-        incr_window=incr_window,
-        compression=plan.compression,
-        one_filesystem=True,
-        extra_pax_flags=plan.extra_pax_flags,
-        framed=framed,
-    )
-
-    hostname = socket.gethostname()
-    entry = manifestlib.ArchiveEntry(
-        filename=fname,
-        kind=kind,
-        cycle_id=cycle_id,
-        date_started=now.isoformat(),
-        date_finished="",
-        size_bytes=0,
-        status="in-progress",
-        hostname=hostname,
-        plan_name=plan.plan_name,
-        incr_window_from=incr_window[0].isoformat() if incr_window else "",
-        incr_window_to=incr_window[1].isoformat() if incr_window else "",
-    )
-    m.append(entry)
-    _save_manifest(m, archive_dir, plan.plan_name)
-
     log_path = args.log_file or _default_log_path(plan.plan_name)
-    _log(args, f"Running {kind} backup → {archive_path}")
-
     sources_abs = [str(Path(s).resolve()) for s in plan.sources]
     excludes_re: list[str] = []
     for g in plan.excludes:
         excludes_re.extend(paxlib.glob_to_regexes(g))
 
+    # Materialise the work list with sizes, then decide how many parallel shards
+    # to write (capped by total size / file count). One backup may be split
+    # across N shard archives written concurrently; the manifest ties them
+    # together by shard_group and surfaces them as one logical backup. N==1
+    # keeps the historical single-archive name and behaviour.
     if kind == "incr":
-        _log(args, f"  ({len(incr_file_list)} changed files)")
-        result = paxlib.run_with_file_list(inv, incr_file_list, log_file=log_path)
+        work = [(p, _member_size(p)) for p in incr_file_list]
     else:
-        # Stream the source trees through pax. We use the same file-list
-        # pipeline as incrementals so we can pre-filter sockets/FIFOs/device
-        # nodes (pax can't archive them and would otherwise exit 1).
-        file_iter = paxlib.iter_archivable_files(
+        work = list(paxlib.iter_archivable_files(
             sources_abs, excludes_re, report.additional_excludes,
-            mtime_window=None,         # no time filter for fulls
-            include_dirs=True,         # preserve directory metadata on restore
-            one_filesystem=True,       # mirror pax -X behaviour
-            skip_special=True,         # drop sockets/FIFOs/devices
-        )
-        result = paxlib.run_with_file_list(inv, file_iter, log_file=log_path)
-    finished = datetime.now(timezone.utc)
+            mtime_window=None, include_dirs=True, one_filesystem=True,
+            skip_special=True, yield_size=True))
+    n = _effective_shards(plan.configured_shards(), work)
+    bins = paxlib.partition_by_size(work, n)
+    stem = fname[: -len(".pax.zst")]   # logical-backup id, e.g. "2026-06-13_full"
 
-    status = result.status
-
-    if status == "failed":
-        # Record the failure immediately so the manifest reflects the on-disk
-        # state (renamed-to-.failed) even if the worker is killed right after.
-        m.update_status(
-            fname,
-            status=status,
-            date_finished=finished.isoformat(),
-            size_bytes=result.archive_size,
-        )
-        _save_manifest(m, archive_dir, plan.plan_name)
-        print(f"ERROR: pax={result.pax_returncode} zstd={result.zstd_returncode}; "
-              f"see {log_path}", file=sys.stderr)
-        # Leave a marker file so the GUI surfaces it.
-        try:
-            archive_path.rename(archive_path.with_suffix(archive_path.suffix + ".failed"))
-        except OSError:
-            pass
-        return 1
-
-    if status == "ok-with-warnings":
-        print(f"WARNING: pax={result.pax_returncode} (non-fatal — archive is trustworthy); "
-              f"see {log_path}", file=sys.stderr)
-
-    has_sidecar = False
-    if result.index_built and indexlib.sidecar_path(archive_path).exists():
-        # Framed run already built the .idx.zst inline off the write stream —
-        # no second pass over the archive (the win on the NFS target).
-        has_sidecar = True
-        _log(args, f"Archive written: {result.archive_size/1024**2:.1f} MiB "
-                   f"in {_hms(result.duration_seconds)} (sidecar built inline)")
-        _mirror_sidecar(plan.plan_name, indexlib.sidecar_path(archive_path), fname)
-    else:
-        # --no-framed runs, or an inline-index failure: fall back to the
-        # post-write re-read pass.
-        _log(args, f"Archive written: {result.archive_size/1024**2:.1f} MiB "
-                   f"in {_hms(result.duration_seconds)} (sidecar pending)")
-        try:
-            indexlib.write_sidecar(archive_path)
-            has_sidecar = True
-            _log(args, "Sidecar index written.")
-            _mirror_sidecar(plan.plan_name, indexlib.sidecar_path(archive_path), fname)
-        except Exception as e:  # noqa: BLE001 - sidecar failure shouldn't fail the backup
-            print(f"WARNING: sidecar generation failed: {e}", file=sys.stderr)
-
-    if not args.no_retention:
-        prune_args = argparse.Namespace(**vars(args))
-        action_prune(prune_args, plan)
-
-    # Persist final state with the true completion time, now that the sidecar
-    # pass and retention are done. `date_finished` reflects the moment the
-    # backup is genuinely complete, not just the archive-write phase.
-    m.update_status(
-        fname,
-        status=status,
-        date_finished=datetime.now(timezone.utc).isoformat(),
-        size_bytes=result.archive_size,
-    )
-    for entry in m.archives:
-        if entry.filename == fname:
-            if result.frame_count > 0:
-                entry.has_frames = True
-            if has_sidecar:
-                entry.has_sidecar = True
-            break
+    hostname = socket.gethostname()
+    specs = []   # (shard_fname, archive_path, files, log_file)
+    for i in range(n):
+        sfname = paxlib.archive_filename(dt=now, kind=kind, manual=args.manual,
+                                         shard_index=i + 1, shard_count=n)
+        slog = log_path if n == 1 else log_path.with_name(
+            f"{log_path.stem}.s{i + 1}of{n}{log_path.suffix}")
+        specs.append((sfname, archive_dir / sfname, bins[i], slog))
+        m.append(manifestlib.ArchiveEntry(
+            filename=sfname, kind=kind, cycle_id=cycle_id,
+            date_started=now.isoformat(), date_finished="", size_bytes=0,
+            status="in-progress", hostname=hostname, plan_name=plan.plan_name,
+            incr_window_from=incr_window[0].isoformat() if incr_window else "",
+            incr_window_to=incr_window[1].isoformat() if incr_window else "",
+            shard_index=i + 1, shard_count=n, shard_group=stem))
     _save_manifest(m, archive_dir, plan.plan_name)
 
+    if n == 1:
+        _log(args, f"Running {kind} backup → {specs[0][1]}")
+    else:
+        _log(args, f"Running {kind} backup → {n} parallel shards "
+                   f"({len(work)} files) under {archive_dir}")
+
+    def _run_spec(spec):
+        sfname, sapath, files, slog = spec
+        inv = paxlib.PaxInvocation(
+            sources=[], chdir=chdir, archive_path=sapath, excludes=plan.excludes,
+            extra_mount_excludes=report.additional_excludes, incr_window=incr_window,
+            compression=plan.compression, one_filesystem=True,
+            extra_pax_flags=plan.extra_pax_flags, framed=framed)
+        return paxlib.run_with_file_list(inv, iter(files), log_file=slog)
+
+    results: list = [None] * n
+    if n == 1:
+        results[0] = _run_spec(specs[0])
+    else:
+        errs: dict = {}
+
+        def _worker(i):
+            try:
+                results[i] = _run_spec(specs[i])
+            except BaseException as exc:  # noqa: BLE001 - surface after join
+                errs[i] = exc
+
+        threads = [threading.Thread(target=_worker, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if errs:
+            raise next(iter(errs.values()))
+
+    statuses = [_finalize_one(m, sapath, sfname, result, plan, args, slog)
+                for (sfname, sapath, _files, slog), result in zip(specs, results)]
+    _save_manifest(m, archive_dir, plan.plan_name)
+
+    # Retention only runs on a clean backup — a partially-failed shard set is an
+    # incomplete cycle and is protected anyway, but skip pruning after failure.
+    any_failed = "failed" in statuses
+    if not any_failed and not args.no_retention:
+        action_prune(argparse.Namespace(**vars(args)), plan)
+
     total = (datetime.now(timezone.utc) - now).total_seconds()
+    if any_failed:
+        nfailed = statuses.count("failed")
+        print(f"ERROR: {nfailed} of {n} shard(s) failed; see {log_path}*",
+              file=sys.stderr)
+        _log(args, f"Backup INCOMPLETE ({nfailed}/{n} shard(s) failed): "
+                   f"{_hms(total)} total.")
+        return 1
     _log(args, f"Backup complete: {_hms(total)} total.")
     return 0
 
