@@ -6,6 +6,7 @@ build/
 dist/
 .venv/
 .claude/
+.omo/
 
 # debian packaging build artifacts
 debian/.debhelper/
