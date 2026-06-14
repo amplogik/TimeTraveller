@@ -371,11 +371,11 @@ class ArchivePanel(QWidget):
         if self._plan is None:
             return
         item = self._archive_list.itemAt(pos)
-        if item is None:
-            return
-        self._archive_list.setCurrentItem(item)  # so _selected_set() resolves
-        data = item.data(0, Qt.ItemDataRole.UserRole)
         menu = QMenu(self)
+        data = None
+        if item is not None:
+            self._archive_list.setCurrentItem(item)  # so _selected_set() resolves
+            data = item.data(0, Qt.ItemDataRole.UserRole)
         if isinstance(data, manifestlib.ShardSet):
             s = data
             if s.status == "failed" and self._recover_tracker is not None:
@@ -383,16 +383,29 @@ class ArchivePanel(QWidget):
             elif (not all(m.has_sidecar for m in s.members)
                   and self._tracker is not None):
                 menu.addAction("Reindex (rebuild sidecar)", self._on_reindex_clicked)
-            if not menu.isEmpty():
-                menu.addSeparator()
             menu.addAction("Export backup…", lambda: self._export_set(s))
             menu.addAction("Delete backup…", lambda: self._delete_set(s))
         elif isinstance(data, CycleListing):
             menu.addAction("Export cycle…", lambda: self._export_cycle(data))
             menu.addAction("Delete cycle…", lambda: self._delete_cycle(data))
-        else:
-            return
+        # Always available — re-reads the backup mount and rebuilds THIS user's
+        # local mirror (manifest + .idx.zst sidecars). Recovers the states where
+        # a backup lists but won't browse ("no sidecar in local mirror") or the
+        # list is empty ("no archives in local mirror") — e.g. after a root-run
+        # system backup whose mirror landed under root. Read-only on the mount;
+        # never needs root.
+        if not menu.isEmpty():
+            menu.addSeparator()
+        menu.addAction("Refresh from mount (rebuild local mirror)",
+                       self._on_refresh_from_mount)
         menu.exec(self._archive_list.viewport().mapToGlobal(pos))
+
+    def _on_refresh_from_mount(self) -> None:
+        if self._plan is None:
+            return
+        self.worker_requested.emit(
+            "Refresh from mount",
+            ["--list-archives", "--refresh-from-mount"])
 
     def _export_into(self, kind: str, ident: str, what: str) -> None:
         """Prompt for a target directory and ask the worker to copy the bundle

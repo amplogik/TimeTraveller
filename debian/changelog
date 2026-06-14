@@ -1,3 +1,21 @@
+timetraveller (1.4.4) unstable; urgency=medium
+
+  * Fix: after a privileged (pkexec) backup/delete/reindex/recover on a
+    system-class plan, the invoking user's local mirror got the manifest but NOT
+    the per-shard .idx.zst sidecar files (they were written to root's mirror).
+    The GUI then listed the backup but couldn't browse it ("no archives in local
+    mirror" / no sidecar). _sync_mirror_from_mount now also copies any on-mount
+    sidecar the user mirror is missing or has a stale copy of (newer source
+    overwrites, so reindex/recover refresh correctly; a delete only stats), so a
+    GUI-run system backup is immediately browsable without --refresh-from-mount.
+  * GUI: new Archives right-click action "Refresh from mount (rebuild local
+    mirror)" — runs --list-archives --refresh-from-mount as a manual escape
+    hatch if the local mirror ever drifts. Available on a backup, a cycle, the
+    empty-list placeholder, and empty space (so it's reachable even when nothing
+    is listed). Read-only on the mount; needs no root.
+
+ -- Kim McCann <amplogik@gmail.com>  Sun, 14 Jun 2026 12:15:00 -0700
+
 timetraveller (1.4.3) unstable; urgency=medium
 
   * Fix: the last two GUI worker actions that didn't escalate on system-class

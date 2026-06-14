@@ -16,6 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
+from timetraveller import index as indexlib
 from timetraveller import manifest as manifestlib
 from timetraveller import worker
 from timetraveller.config import (
@@ -184,3 +185,46 @@ def test_delete_set_unknown_id_errors(tmp_path, monkeypatch):
     plan, archive_dir = _setup(tmp_path, monkeypatch, full)
     assert worker.action_delete_set(_args(delete_set="nope"), plan) == 1
     assert len(_reload(archive_dir).archives) == 2
+
+
+# ---------- _sync_mirror_from_mount: manifest AND sidecars ----------
+
+def test_sync_mirror_seeds_missing_sidecars(tmp_path, monkeypatch):
+    """After a privileged op, the user mirror must get both the manifest and the
+    per-shard .idx.zst sidecars — else the GUI lists the backup but can't browse
+    it ('no local mirror sidecar'). Regression for the 2026-06-14 system run."""
+    entries = _set("2026-06-14_full", "full", 3)
+    plan, archive_dir = _setup(tmp_path, monkeypatch, entries)
+    _touch(archive_dir, entries)   # archives + .idx.zst sidecars on the mount
+
+    # User mirror starts empty.
+    for e in entries:
+        assert not indexlib.sidecar_mirror_path("tp", e.filename).exists()
+
+    worker._sync_mirror_from_mount(plan)
+
+    # Manifest mirror written, and every sidecar copied into the user mirror.
+    assert manifestlib.mirror_manifest_path("tp").exists()
+    for e in entries:
+        assert indexlib.sidecar_mirror_path("tp", e.filename).exists()
+
+
+def test_sync_mirror_refreshes_stale_sidecar(tmp_path, monkeypatch):
+    """A reindex/recover rewrites a sidecar; the sync must refresh a stale mirror
+    copy (newer source overwrites), not skip it."""
+    import os
+    entries = _set("2026-06-14_full", "full", 1)
+    plan, archive_dir = _setup(tmp_path, monkeypatch, entries)
+    _touch(archive_dir, entries)
+    fname = entries[0].filename
+
+    # Seed an OLD mirror sidecar, then make the on-mount one newer with new bytes.
+    worker._sync_mirror_from_mount(plan)
+    mirror = indexlib.sidecar_mirror_path("tp", fname)
+    old_mtime = mirror.stat().st_mtime
+    src = indexlib.sidecar_path(archive_dir / fname)
+    src.write_text("REBUILT")
+    os.utime(src, (old_mtime + 10, old_mtime + 10))
+
+    worker._sync_mirror_from_mount(plan)
+    assert mirror.read_text() == "REBUILT"

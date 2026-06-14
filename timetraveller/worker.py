@@ -1064,16 +1064,34 @@ def _delete_via_pkexec(args: argparse.Namespace, plan: configlib.PlanConfig,
 
 
 def _sync_mirror_from_mount(plan: configlib.PlanConfig) -> None:
-    """Best-effort: copy the on-mount manifest into THIS user's local mirror.
+    """Best-effort: sync THIS user's local mirror (manifest + sidecars) from the
+    on-mount state after a privileged (pkexec) op.
 
-    After a privileged (pkexec) delete, root has updated the on-mount manifest
-    and root's own mirror, but the GUI reads the invoking user's mirror — sync
-    it so the deletion shows up without a manual --refresh-from-mount."""
+    A privileged backup/delete/reindex/recover runs as root and writes ROOT's
+    mirror, not the invoking user's. We copy the on-mount manifest into the user
+    mirror so the GUI's list reflects the change — AND copy any on-mount .idx.zst
+    sidecar the user mirror is missing or has an older copy of, so the GUI can
+    actually browse/restore the new (or reindexed/recovered) archives. The
+    manifest's has_sidecar flag is meaningless to the GUI without the local
+    sidecar file present. Only missing/stale sidecars are read, so a delete
+    (nothing new) costs just a stat per remaining entry."""
+    archive_dir = plan.archive_dir()
     try:
-        on_mount = manifestlib.load(manifestlib.manifest_path(plan.archive_dir()))
+        on_mount = manifestlib.load(manifestlib.manifest_path(archive_dir))
         manifestlib.save(on_mount, manifestlib.mirror_manifest_path(plan.plan_name))
     except OSError:
-        pass  # mount unreadable or mirror unwritable; GUI can refresh manually
+        return  # mount unreadable or mirror unwritable; GUI can refresh manually
+    for entry in on_mount.archives:
+        src = indexlib.sidecar_path(archive_dir / entry.filename)
+        if not src.exists():
+            continue
+        mirror = indexlib.sidecar_mirror_path(plan.plan_name, entry.filename)
+        try:
+            if mirror.exists() and mirror.stat().st_mtime >= src.stat().st_mtime:
+                continue  # user mirror already has this sidecar, up to date
+        except OSError:
+            pass
+        _mirror_sidecar(plan.plan_name, src, entry.filename)
 
 
 def _backup_via_pkexec(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:

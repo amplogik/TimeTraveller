@@ -199,8 +199,9 @@ In the **Archives** tab, right-click a cycle or a single backup for the manageme
 - **Delete** a cycle or a single backup. Deletion is type-to-confirm and discloses the blast radius (how many shards, and any dependent incrementals); it refuses the newest complete cycle unless you confirm.
 - **Export** a whole backup or cycle as a self-contained bundle (every shard + sidecars + a manifest slice) to another directory — handy for offlining a copy to a USB drive.
 - **Recover** a backup the status column shows as **failed**: if its compressed stream is actually intact (the common case is a file that vanished mid-walk), recovery re-reads it as proof, rebuilds the sidecar, and flips it back to `ok-with-warnings`.
+- **Refresh from mount (rebuild local mirror)** — re-reads the backup mount and rebuilds your local manifest + sidecar mirror. Use it if the Archives tab ever lists a backup it can't browse, or shows nothing at all, for a plan you know has backups on disk (most often after a root-run `system`/`homes` backup, whose mirror lands under root). It's read-only on the mount and never needs root; it's available even on empty space so you can reach it when the list is empty.
 
-For `system`/`homes` plans these all go through a single Polkit prompt (see *Sudo and system plans* above).
+For `system`/`homes` plans the destructive actions (delete) and maintenance (reindex/recover) go through a single Polkit prompt (see *Sudo and system plans* above); browse, export, verify, and refresh-from-mount run as your user.
 
 ### Backup status: ok / ok-with-warnings / failed
 
