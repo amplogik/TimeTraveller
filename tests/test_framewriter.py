@@ -79,7 +79,7 @@ def test_compressed_offsets_match_actual_file_layout(tmp_path):
     assert total_cl == archive.stat().st_size == result["total_compressed"]
 
 
-def test_sidecar_schema_v1(tmp_path):
+def test_sidecar_schema_v2(tmp_path):
     archive = tmp_path / "a.pax.zst"
     src = io.BytesIO(_payload(2 * 1024 * 1024))
 
@@ -87,14 +87,18 @@ def test_sidecar_schema_v1(tmp_path):
     sidecar = framewriter.sidecar_path(archive)
     payload = json.loads(sidecar.read_text())
 
-    for key in ("version", "frame_size", "zstd_level", "total_uncompressed",
-                "total_compressed", "elapsed_seconds", "frame_count", "frames"):
+    for key in ("version", "frame_size", "zstd_level", "csum_algo",
+                "total_uncompressed", "total_compressed", "elapsed_seconds",
+                "frame_count", "frames"):
         assert key in payload, f"sidecar missing key {key!r}"
 
-    assert payload["version"] == 1
+    assert payload["version"] == 2
+    assert payload["csum_algo"] == "sha256"
     assert payload["frame_size"] == 1024 * 1024
     assert payload["zstd_level"] == 3
     assert isinstance(payload["frames"], list)
+    for fr in payload["frames"]:
+        assert len(fr["csum"]) == 64   # hex sha256
 
 
 def test_partial_sidecar_cleaned_up_on_success(tmp_path):

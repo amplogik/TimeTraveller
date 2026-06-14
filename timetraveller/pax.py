@@ -312,6 +312,16 @@ _BENIGN_FILE_ENOENT = re.compile(
     r":\s*Cannot (?:stat|open):\s*No such file or directory\s*$"
 )
 
+# A benign per-file race: a listed file was modified (or appended to) while tar
+# was reading it. tar still writes a structurally valid member — it just may be
+# a torn point-in-time read of a volatile file (rotating logs, sqlite/leveldb
+# write-ahead files). POSIX/GNU report this as the archetypal exit-1 warning;
+# it only reaches this matcher when it co-occurs with a vanished-file (exit 2)
+# line in the same run, which must not turn an otherwise-benign run into a fail.
+_BENIGN_FILE_CHANGED = re.compile(
+    r":\s*file changed as we read it\s*$"
+)
+
 # tar's generic trailer, printed once when any per-file error occurred. Benign
 # on its own — it only summarises the per-file diagnostics above it.
 _BENIGN_SUMMARY = re.compile(
@@ -341,7 +351,9 @@ def _stderr_is_only_benign(stderr_text: str) -> bool:
             continue
         saw_diag = True
         if not (s.startswith("tar:")
-                and (_BENIGN_FILE_ENOENT.search(s) or _BENIGN_SUMMARY.search(s))):
+                and (_BENIGN_FILE_ENOENT.search(s)
+                     or _BENIGN_FILE_CHANGED.search(s)
+                     or _BENIGN_SUMMARY.search(s))):
             return False
     # Exit was >=2, so there must be *some* diagnostic explaining it; if we
     # captured none we recognise, don't certify the archive as trustworthy.
@@ -419,9 +431,11 @@ class RunResult:
         pass ("Cannot stat: No such file or directory") as exit 2, even though
         it skips the member and the stream stays valid — semantically the same
         benign race as exit 1. So an exit >=2 whose stderr contains *only* such
-        ENOENT lines is also downgraded to "ok-with-warnings". Any other fatal
-        diagnostic, a zstd failure, or stderr we couldn't capture keeps it
-        "failed".
+        ENOENT lines (and/or "file changed as we read it" warnings, which are
+        themselves benign exit-1 races that only land here when they co-occur
+        with a vanished-file line) is also downgraded to "ok-with-warnings".
+        Any other fatal diagnostic, a zstd failure, or stderr we couldn't
+        capture keeps it "failed".
         """
         if self.zstd_returncode != 0:
             return "failed"

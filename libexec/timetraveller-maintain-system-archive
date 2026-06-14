@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Privileged helper for TimeTraveller system-class archive maintenance.
+
+Covers the two GUI-launched, single-archive maintenance jobs that write into a
+root-owned archive directory: rebuilding a `.idx.zst` sidecar (--reindex) and
+un-quarantining a failed-but-intact backup (--recover-failed). Invoked via
+pkexec by the unprivileged GUI; we run as root here, so this is security-
+critical:
+
+ - The plan name must be in a fixed allowlist (system, homes).
+ - The action is exactly one of --reindex / --recover-failed.
+ - The identifier is either the literal `*` (only for --reindex: "fix all
+   missing sidecars") or a strict archive filename: charset [A-Za-z0-9_.-],
+   no slash, no "..", and it must end in `.pax.zst`. So it can neither traverse
+   paths nor name a non-archive file nor smuggle extra arguments.
+ - We accept no path from the caller. We re-exec the *canonical*, hardcoded
+   timetraveller-backup binary with a *fixed* argument vector (no shell),
+   pointing it at /etc/timetraveller/<plan>.yaml; the archive directory follows
+   from that root-owned config. Streams are inherited so progress is visible.
+
+Usage (called by pkexec):
+    timetraveller-maintain-system-archive <plan> --reindex        <archive|*>
+    timetraveller-maintain-system-archive <plan> --recover-failed <archive>
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+
+ALLOWED_PLANS = frozenset({"system", "homes"})
+ALLOWED_ACTIONS = frozenset({"--reindex", "--recover-failed"})
+
+ALLOWED_BINARIES = (
+    "/usr/bin/timetraveller-backup",
+    "/usr/local/bin/timetraveller-backup",
+)
+
+ETC_DIR = "/etc/timetraveller"
+
+# A concrete archive filename, e.g. "2026-06-14_full.s1of4.pax.zst". Dots are
+# allowed (extensions) but ".." is rejected separately, and there is no slash in
+# the charset, so the name can't escape the archive directory.
+ARCHIVE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}\.pax\.zst$")
+
+
+def fail(msg: str, code: int = 2) -> None:
+    print(f"timetraveller-maintain-system-archive: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def validate_plan(plan: str) -> None:
+    if plan not in ALLOWED_PLANS:
+        fail(f"refusing: plan {plan!r} not in allowed set {sorted(ALLOWED_PLANS)}")
+
+
+def validate_action(action: str) -> None:
+    if action not in ALLOWED_ACTIONS:
+        fail(f"refusing: action {action!r} not in {sorted(ALLOWED_ACTIONS)}", code=64)
+
+
+def validate_ident(action: str, ident: str) -> None:
+    if ident == "*":
+        if action != "--reindex":
+            fail(f"refusing: '*' is only valid with --reindex, not {action}")
+        return
+    if ".." in ident or not ARCHIVE_RE.match(ident):
+        fail(f"refusing: identifier {ident!r} is not a valid archive filename")
+
+
+def canonical_binary() -> str:
+    for p in ALLOWED_BINARIES:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    fail("no canonical timetraveller-backup binary found", code=3)
+
+
+def build_command(plan: str, action: str, ident: str) -> list[str]:
+    validate_plan(plan)
+    validate_action(action)
+    validate_ident(action, ident)
+    config = os.path.join(ETC_DIR, f"{plan}.yaml")
+    if not os.path.isfile(config):
+        fail(f"refusing: config {config} does not exist", code=3)
+    return [canonical_binary(), "--plan", plan, "--config", config, action, ident]
+
+
+def main(argv: list[str]) -> int:
+    if os.geteuid() != 0:
+        fail("must be run as root (typically via pkexec)", code=4)
+    if len(argv) != 3:
+        fail("usage: <plan> {--reindex|--recover-failed} <archive|*>", code=64)
+    cmd = build_command(argv[0], argv[1], argv[2])
+    return subprocess.run(cmd).returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

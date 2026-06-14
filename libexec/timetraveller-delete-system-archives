@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""Privileged helper to delete TimeTraveller system-class plan archives.
+
+Invoked via pkexec by the unprivileged GUI/CLI. We run as root here, so this
+script is security-critical:
+
+ - The plan name must be in a fixed allowlist (system, homes). The cron/config
+   helpers use the same set.
+ - The action is exactly one of --delete-cycle / --delete-set, and the
+   identifier must pass a strict charset check: alphanumerics, dash and
+   underscore only. No dots, no slashes, no shell metacharacters — so it can
+   neither traverse paths nor smuggle extra arguments.
+ - We do NOT accept any path from the caller. We re-exec the *canonical*,
+   hardcoded timetraveller-backup binary with a *fixed* argument vector (no
+   shell), pointing it at /etc/timetraveller/<plan>.yaml. The worker derives
+   the archive directory from that root-owned config, so the deletion is
+   contained to this plan's own archive tree — the caller can't redirect it.
+ - --force is forwarded only if the caller passed it, preserving the worker's
+   "refuse the newest complete cycle" guard for callers that didn't.
+
+Usage (called by pkexec):
+    timetraveller-delete-system-archives <plan> --delete-cycle <cycle_id> [--force]
+    timetraveller-delete-system-archives <plan> --delete-set   <group_id> [--force]
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+
+# Plan names whose archives this helper is allowed to delete. Kept in sync with
+# timetraveller.config.SYSTEM_PLAN_NAMES.
+ALLOWED_PLANS = frozenset({"system", "homes"})
+
+ALLOWED_ACTIONS = frozenset({"--delete-cycle", "--delete-set"})
+
+# The only binaries we will re-exec. Hardcoded so this helper can't be tricked
+# into running an arbitrary program as root.
+ALLOWED_BINARIES = (
+    "/usr/bin/timetraveller-backup",
+    "/usr/local/bin/timetraveller-backup",
+)
+
+ETC_DIR = "/etc/timetraveller"
+
+# A cycle_id ("2026-06-14", "2026-06-14T132920") or a group_id stem
+# ("2026-06-14_full", "2026-06-14T132920_incr"). Deliberately excludes '.' and
+# '/' so it can neither escape the archive dir nor name a sidecar/extension.
+IDENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-]{0,63}$")
+
+
+def fail(msg: str, code: int = 2) -> None:
+    print(f"timetraveller-delete-system-archives: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def validate_plan(plan: str) -> None:
+    if plan not in ALLOWED_PLANS:
+        fail(f"refusing: plan {plan!r} not in allowed set {sorted(ALLOWED_PLANS)}")
+
+
+def validate_action(action: str) -> None:
+    if action not in ALLOWED_ACTIONS:
+        fail(f"refusing: action {action!r} not in {sorted(ALLOWED_ACTIONS)}", code=64)
+
+
+def validate_ident(ident: str) -> None:
+    if not IDENT_RE.match(ident):
+        fail(f"refusing: identifier {ident!r} fails the strict charset check")
+
+
+def canonical_binary() -> str:
+    for p in ALLOWED_BINARIES:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    fail("no canonical timetraveller-backup binary found", code=3)
+
+
+def build_command(plan: str, action: str, ident: str, force: bool) -> list[str]:
+    """Construct the fixed argv to re-exec. All four inputs are validated first.
+    The config path is computed from the plan name against a fixed prefix —
+    never taken from the caller — so the archive dir the worker derives from it
+    stays contained to this plan's tree."""
+    validate_plan(plan)
+    validate_action(action)
+    validate_ident(ident)
+    config = os.path.join(ETC_DIR, f"{plan}.yaml")
+    if not os.path.isfile(config):
+        fail(f"refusing: config {config} does not exist", code=3)
+    cmd = [canonical_binary(), "--plan", plan, "--config", config, action, ident]
+    if force:
+        cmd.append("--force")
+    return cmd
+
+
+def main(argv: list[str]) -> int:
+    if os.geteuid() != 0:
+        fail("must be run as root (typically via pkexec)", code=4)
+
+    if len(argv) not in (3, 4):
+        fail("usage: <plan> {--delete-cycle|--delete-set} <id> [--force]", code=64)
+    if len(argv) == 4 and argv[3] != "--force":
+        fail(f"refusing: unexpected 4th argument {argv[3]!r}", code=64)
+
+    plan, action, ident = argv[0], argv[1], argv[2]
+    force = len(argv) == 4
+    cmd = build_command(plan, action, ident, force)
+    # No shell; fixed argv.
+    return subprocess.run(cmd).returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

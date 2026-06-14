@@ -78,8 +78,13 @@ def build_parser() -> argparse.ArgumentParser:
                               "integrity check), and finalizes the manifest entry to "
                               "'ok-with-warnings'. If the stream is truncated or corrupt the "
                               "archive is re-quarantined and the entry stays 'failed'.")
-    actions.add_argument("--verify", type=str, default=None,
-                         help="Stream the named archive through pax -r to /dev/null to check integrity.")
+    actions.add_argument("--verify", type=str, default=None, metavar="ARCHIVE",
+                         help="Check archive integrity. Accepts a shard-group stem "
+                              "(e.g. 2026-06-14_full) or a single filename; verifies "
+                              "every shard. v2 archives use per-frame SHA-256 from the "
+                              ".frames.json sidecar (no decompression); older archives "
+                              "fall back to a full decompress. Includes quarantined "
+                              "(.failed) archives.")
     actions.add_argument("--extract", type=str, default=None, metavar="ARCHIVE",
                          help="Restore files or subtrees from the named archive into --into "
                               "(default: cwd). Positional args are paths within the archive; "
@@ -654,6 +659,8 @@ def _should_prune(root: str, d: str, src_dev: int, skip_targets: set[str],
 
 
 def action_reindex(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
+    if _needs_root_escalation(plan):
+        return _maint_via_pkexec(args, plan, "--reindex", args.reindex)
     archive_dir = plan.archive_dir()
     target = args.reindex
     if target == "*":
@@ -741,6 +748,8 @@ def action_recover_failed(args: argparse.Namespace, plan: configlib.PlanConfig) 
     archive is left (or put back) at its .failed name so the manifest's
     failed-status <-> .failed-on-disk invariant holds for a later retry.
     """
+    if _needs_root_escalation(plan):
+        return _maint_via_pkexec(args, plan, "--recover-failed", args.recover_failed)
     archive_dir = plan.archive_dir()
     fname = args.recover_failed
     m = manifestlib.load(manifestlib.manifest_path(archive_dir))
@@ -873,29 +882,112 @@ def action_extract(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
     return 0
 
 
+def _resolve_verify_targets(archive_dir: Path, identifier: str) -> list[Path]:
+    """Map a --verify identifier to the archive file(s) to check.
+
+    Like _resolve_extract_targets, but also accepts a quarantined `<name>.failed`
+    archive (so a cycle that was marked failed can still be verified) and returns
+    the bare path that actually exists on disk for each shard.
+    """
+    def _present(name: str) -> Path | None:
+        bare = archive_dir / name
+        if bare.exists():
+            return bare
+        failed = bare.with_name(name + ".failed")
+        return failed if failed.exists() else None
+
+    group = manifestlib._group_id_from_filename(identifier)
+    try:
+        m = manifestlib.load(manifestlib.manifest_path(archive_dir))
+    except (OSError, ValueError):
+        m = None
+    if m is not None:
+        hits = [p for e in m.archives if manifestlib.group_id_for(e) == group
+                for p in (_present(e.filename),) if p is not None]
+        if hits:
+            return sorted(hits)
+    p = _present(identifier)
+    return [p] if p is not None else []
+
+
+def _verify_frames(archive_path: Path) -> tuple[str, int, list[dict]] | None:
+    """Decompress-free integrity check using the v2 frames.json `csum` digests.
+
+    Re-reads each frame's persisted compressed bytes and compares their hash to
+    the digest recorded at write time. Returns (algo, frame_count, bad_frames)
+    where each bad frame is {id, uo, ul}, or None if no v2 (csum-bearing)
+    sidecar exists — the caller then falls back to a full decompress.
+    """
+    import hashlib
+    import json
+    sidecar = framewriter.sidecar_path(archive_path)
+    if not sidecar.exists():
+        return None
+    try:
+        meta = json.loads(sidecar.read_text())
+    except (OSError, ValueError):
+        return None
+    frames = meta.get("frames") or []
+    if not frames or "csum" not in frames[0]:
+        return None  # v1 sidecar: no per-frame digests
+    algo = meta.get("csum_algo", "sha256")
+    bad: list[dict] = []
+    with open(archive_path, "rb") as f:
+        for fr in frames:
+            co, cl = fr["co"], fr["cl"]
+            f.seek(co)
+            data = f.read(cl)
+            if len(data) != cl or hashlib.new(algo, data).hexdigest() != fr["csum"]:
+                bad.append({"id": fr["id"], "uo": fr["uo"], "ul": fr["ul"]})
+    return (algo, len(frames), bad)
+
+
 def action_verify(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
     import subprocess
-    archive = plan.archive_dir() / args.verify
-    if not archive.exists():
-        print(f"archive not found: {archive}", file=sys.stderr)
+    archive_dir = plan.archive_dir()
+    targets = _resolve_verify_targets(archive_dir, args.verify)
+    if not targets:
+        print(f"archive not found: {archive_dir / args.verify}", file=sys.stderr)
         return 1
-    # Stream the archive through `tar -tf` (list mode) so tar reads every
-    # entry header end-to-end without extracting. Any corruption shows up
-    # as a non-zero exit code.
-    zstdcat = subprocess.Popen(["zstdcat", str(archive)], stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL)
-    tar = subprocess.Popen(["tar", "-tf", "-"], stdin=zstdcat.stdout,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    zstdcat.stdout.close()  # type: ignore[union-attr]
-    _, err = tar.communicate()
-    zstdcat.wait()
-    if tar.returncode != 0:
-        print(f"verify: archive {archive.name} FAILED", file=sys.stderr)
-        if err:
-            print(err.decode(errors="replace"), file=sys.stderr)
-        return 1
-    print(f"verify: archive {archive.name} OK")
-    return 0
+
+    overall_ok = True
+    for archive in targets:
+        res = _verify_frames(archive)
+        if res is not None:
+            algo, nframes, bad = res
+            if bad:
+                overall_ok = False
+                print(f"verify: {archive.name} FAILED — {len(bad)}/{nframes} "
+                      f"corrupt frame(s) [{algo}]", file=sys.stderr)
+                for b in bad[:20]:
+                    end = b["uo"] + b["ul"]
+                    print(f"    frame {b['id']}: uncompressed bytes "
+                          f"[{b['uo']}, {end})", file=sys.stderr)
+                if len(bad) > 20:
+                    print(f"    ... and {len(bad) - 20} more", file=sys.stderr)
+            else:
+                print(f"verify: {archive.name} OK "
+                      f"({nframes} frames, {algo}, decompress-free)")
+            continue
+
+        # Fallback for v1 / sidecar-less archives: stream through `tar -tf` so
+        # tar reads every entry header end-to-end. Any corruption (which zstd's
+        # own frame checksum also now flags on v2 archives) shows as nonzero.
+        zstdcat = subprocess.Popen(["zstdcat", str(archive)], stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL)
+        tar = subprocess.Popen(["tar", "-tf", "-"], stdin=zstdcat.stdout,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        zstdcat.stdout.close()  # type: ignore[union-attr]
+        _, err = tar.communicate()
+        zstdcat.wait()
+        if tar.returncode != 0:
+            overall_ok = False
+            print(f"verify: {archive.name} FAILED (full decompress)", file=sys.stderr)
+            if err:
+                print(err.decode(errors="replace"), file=sys.stderr)
+        else:
+            print(f"verify: {archive.name} OK (full decompress)")
+    return 0 if overall_ok else 1
 
 
 def action_prune(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
@@ -935,6 +1027,92 @@ def _load_plan_manifest(plan: configlib.PlanConfig):
     return archive_dir, m
 
 
+def _needs_root_escalation(plan: configlib.PlanConfig) -> bool:
+    """True if a mutating action (backup, delete) must be re-run as root via a
+    pkexec helper: a system-class plan whose archive dir/manifest are owned by
+    root, and we're not already root.
+
+    When a helper re-execs the worker as root, euid==0 short-circuits this so the
+    privileged run does the real work instead of re-escalating."""
+    return (plan.plan_name in configlib.SYSTEM_PLAN_NAMES
+            and os.geteuid() != 0)
+
+
+def _delete_via_pkexec(args: argparse.Namespace, plan: configlib.PlanConfig,
+                       action_flag: str, ident: str) -> int:
+    """Run a system-class delete as root through the pkexec helper, then refresh
+    THIS user's local manifest mirror from the (root-updated) on-mount manifest
+    so the GUI reflects the deletion immediately.
+
+    --force is forwarded only when the caller passed it, so the worker's
+    newest-complete-cycle guard still protects an un-forced ad-hoc CLI delete.
+    """
+    import subprocess
+    cmd = ["pkexec", DELETE_HELPER_PATH, plan.plan_name, action_flag, ident]
+    if getattr(args, "force", False):
+        cmd.append("--force")
+    _log(args, f"Deleting {ident} for {plan.plan_name} via pkexec {DELETE_HELPER_PATH}")
+    r = subprocess.run(cmd, text=True, capture_output=True)
+    if r.stdout:
+        sys.stdout.write(r.stdout)
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr or "")
+        print(f"\nERROR: delete helper exited {r.returncode}", file=sys.stderr)
+        return r.returncode
+    _sync_mirror_from_mount(plan)
+    return 0
+
+
+def _sync_mirror_from_mount(plan: configlib.PlanConfig) -> None:
+    """Best-effort: copy the on-mount manifest into THIS user's local mirror.
+
+    After a privileged (pkexec) delete, root has updated the on-mount manifest
+    and root's own mirror, but the GUI reads the invoking user's mirror — sync
+    it so the deletion shows up without a manual --refresh-from-mount."""
+    try:
+        on_mount = manifestlib.load(manifestlib.manifest_path(plan.archive_dir()))
+        manifestlib.save(on_mount, manifestlib.mirror_manifest_path(plan.plan_name))
+    except OSError:
+        pass  # mount unreadable or mirror unwritable; GUI can refresh manually
+
+
+def _backup_via_pkexec(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
+    """Run a manual system-class backup as root through the pkexec helper, then
+    resync THIS user's local manifest mirror so the GUI reflects the new cycle.
+
+    Streams are inherited (not captured) so the long-running backup's progress
+    reaches the GUI's run dialog live."""
+    import subprocess
+    cmd = ["pkexec", BACKUP_HELPER_PATH, plan.plan_name, "--kind", args.kind]
+    if getattr(args, "manual", False):
+        cmd.append("--manual")
+    _log(args, f"Running {args.kind} backup for {plan.plan_name} via pkexec "
+               f"{BACKUP_HELPER_PATH}")
+    rc = subprocess.run(cmd).returncode
+    if rc != 0:
+        print(f"\nERROR: backup helper exited {rc}", file=sys.stderr)
+        return rc
+    _sync_mirror_from_mount(plan)
+    return 0
+
+
+def _maint_via_pkexec(args: argparse.Namespace, plan: configlib.PlanConfig,
+                      action_flag: str, ident: str) -> int:
+    """Run a system-class single-archive maintenance job (--reindex /
+    --recover-failed) as root through the pkexec helper, then resync THIS user's
+    manifest mirror so the GUI reflects the updated has_sidecar / status."""
+    import subprocess
+    cmd = ["pkexec", MAINT_HELPER_PATH, plan.plan_name, action_flag, ident]
+    _log(args, f"{action_flag} {ident} for {plan.plan_name} via pkexec "
+               f"{MAINT_HELPER_PATH}")
+    rc = subprocess.run(cmd).returncode
+    if rc != 0:
+        print(f"\nERROR: maintenance helper exited {rc}", file=sys.stderr)
+        return rc
+    _sync_mirror_from_mount(plan)
+    return 0
+
+
 def action_delete_cycle(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
     """Delete one whole cycle (full + incrementals, every shard) by cycle_id.
 
@@ -943,6 +1121,8 @@ def action_delete_cycle(args: argparse.Namespace, plan: configlib.PlanConfig) ->
     radius disclosure; the bare guard protects ad-hoc CLI/script use.
     """
     cid = args.delete_cycle
+    if _needs_root_escalation(plan):
+        return _delete_via_pkexec(args, plan, "--delete-cycle", cid)
     archive_dir, m = _load_plan_manifest(plan)
     target = next((c for c in manifestlib.cycles(m) if c.cycle_id == cid), None)
     if target is None:
@@ -954,8 +1134,11 @@ def action_delete_cycle(args: argparse.Namespace, plan: configlib.PlanConfig) ->
               f"(use --force to override).", file=sys.stderr)
         return 1
     sets = ([target.full_set] if target.full_set else []) + target.incr_sets
-    n = _delete_sets(archive_dir, plan.plan_name, sets, m,
-                     log=lambda msg: _log(args, msg))
+    try:
+        n = _delete_sets(archive_dir, plan.plan_name, sets, m,
+                         log=lambda msg: _log(args, msg))
+    except PermissionError as e:
+        return _report_delete_permission_error(plan, e)
     _log(args, f"delete-cycle {cid}: removed {n} shard archive(s).")
     return 0
 
@@ -968,6 +1151,8 @@ def action_delete_set(args: argparse.Namespace, plan: configlib.PlanConfig) -> i
     are not blocked here — the GUI discloses dependents and passes --force.
     """
     gid = args.delete_set
+    if _needs_root_escalation(plan):
+        return _delete_via_pkexec(args, plan, "--delete-set", gid)
     archive_dir, m = _load_plan_manifest(plan)
     target = next((s for s in manifestlib.shard_sets(m) if s.group_id == gid), None)
     if target is None:
@@ -987,10 +1172,27 @@ def action_delete_set(args: argparse.Namespace, plan: configlib.PlanConfig) -> i
                           f"full; refusing (use --force).", file=sys.stderr)
                     return 1
                 break
-    n = _delete_sets(archive_dir, plan.plan_name, [target], m,
-                     log=lambda msg: _log(args, msg))
+    try:
+        n = _delete_sets(archive_dir, plan.plan_name, [target], m,
+                         log=lambda msg: _log(args, msg))
+    except PermissionError as e:
+        return _report_delete_permission_error(plan, e)
     _log(args, f"delete-set {gid}: removed {n} shard archive(s).")
     return 0
+
+
+def _report_delete_permission_error(plan: configlib.PlanConfig,
+                                    e: PermissionError) -> int:
+    """Turn a bare unlink PermissionError into a clean, actionable message
+    instead of a traceback. System-class plans escalate via pkexec, so reaching
+    here means either a non-system plan on an unwritable mount, or root itself
+    lacking write access (e.g. a read-only export)."""
+    where = getattr(e, "filename", None) or plan.archive_dir()
+    print(f"ERROR: permission denied removing archives under {where}.\n"
+          f"  System-class plans ({', '.join(sorted(configlib.SYSTEM_PLAN_NAMES))}) "
+          f"delete via pkexec; other plans need write access to the archive "
+          f"directory on the mount.", file=sys.stderr)
+    return 13
 
 
 def _member_files(archive_dir: Path, filename: str) -> list[Path]:
@@ -1321,6 +1523,9 @@ _INSTALLED_BINARY_CANDIDATES = (
     "/usr/local/bin/timetraveller-backup",
 )
 PKEXEC_HELPER_PATH = "/usr/libexec/timetraveller-install-system-cron"
+DELETE_HELPER_PATH = "/usr/libexec/timetraveller-delete-system-archives"
+BACKUP_HELPER_PATH = "/usr/libexec/timetraveller-run-system-backup"
+MAINT_HELPER_PATH = "/usr/libexec/timetraveller-maintain-system-archive"
 
 
 def _default_installed_binary() -> str:
@@ -1519,6 +1724,13 @@ def _acquire_plan_lock(plan_name: str):
 
 
 def action_backup(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
+    # A manual system-class backup from the GUI runs as the unprivileged user
+    # but writes a root-owned archive dir/manifest; escalate via the pkexec
+    # helper (scheduled runs already execute as root via cron). euid==0 in the
+    # re-exec'd worker short-circuits this so the privileged run does the work.
+    if _needs_root_escalation(plan):
+        return _backup_via_pkexec(args, plan)
+
     now = datetime.now(timezone.utc)
     kind = _resolve_kind(args.kind, plan, now)
 

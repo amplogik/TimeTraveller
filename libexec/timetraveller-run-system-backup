@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""Privileged helper to run a TimeTraveller system-class plan backup.
+
+Invoked via pkexec by the unprivileged GUI for a *manual* "Run full/incr now"
+on a system-class plan, whose archive directory and manifest are owned by root.
+(Scheduled runs already execute as root via cron; only the manual GUI path
+needed escalation.) We run as root here, so this script is security-critical:
+
+ - The plan name must be in a fixed allowlist (system, homes).
+ - The kind must be one of full / incr / auto.
+ - We accept no path from the caller. We re-exec the *canonical*, hardcoded
+   timetraveller-backup binary with a *fixed* argument vector (no shell),
+   pointing it at /etc/timetraveller/<plan>.yaml. Everything the backup reads
+   and writes follows from that root-owned config.
+ - Streams are inherited (not captured) so the backup's progress flows live to
+   the GUI's run dialog.
+
+Usage (called by pkexec):
+    timetraveller-run-system-backup <plan> --kind <full|incr|auto> [--manual]
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+
+ALLOWED_PLANS = frozenset({"system", "homes"})
+ALLOWED_KINDS = frozenset({"full", "incr", "auto"})
+
+ALLOWED_BINARIES = (
+    "/usr/bin/timetraveller-backup",
+    "/usr/local/bin/timetraveller-backup",
+)
+
+ETC_DIR = "/etc/timetraveller"
+
+
+def fail(msg: str, code: int = 2) -> None:
+    print(f"timetraveller-run-system-backup: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def validate_plan(plan: str) -> None:
+    if plan not in ALLOWED_PLANS:
+        fail(f"refusing: plan {plan!r} not in allowed set {sorted(ALLOWED_PLANS)}")
+
+
+def validate_kind(kind: str) -> None:
+    if kind not in ALLOWED_KINDS:
+        fail(f"refusing: kind {kind!r} not in {sorted(ALLOWED_KINDS)}", code=64)
+
+
+def canonical_binary() -> str:
+    for p in ALLOWED_BINARIES:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    fail("no canonical timetraveller-backup binary found", code=3)
+
+
+def build_command(plan: str, kind: str, manual: bool) -> list[str]:
+    """Construct the fixed argv to re-exec, after validating every input.
+    The config path is computed from the plan name against a fixed prefix —
+    never taken from the caller."""
+    validate_plan(plan)
+    validate_kind(kind)
+    config = os.path.join(ETC_DIR, f"{plan}.yaml")
+    if not os.path.isfile(config):
+        fail(f"refusing: config {config} does not exist", code=3)
+    cmd = [canonical_binary(), "--plan", plan, "--config", config, "--kind", kind]
+    if manual:
+        cmd.append("--manual")
+    return cmd
+
+
+def main(argv: list[str]) -> int:
+    if os.geteuid() != 0:
+        fail("must be run as root (typically via pkexec)", code=4)
+
+    # Expected: <plan> --kind <kind> [--manual]
+    if len(argv) < 3 or argv[1] != "--kind":
+        fail("usage: <plan> --kind <full|incr|auto> [--manual]", code=64)
+    plan, kind = argv[0], argv[2]
+    rest = argv[3:]
+    manual = rest == ["--manual"]
+    if rest and not manual:
+        fail(f"refusing: unexpected trailing arguments {rest!r}", code=64)
+
+    cmd = build_command(plan, kind, manual)
+    # No shell; fixed argv. Streams inherited so progress reaches the GUI live.
+    return subprocess.run(cmd).returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

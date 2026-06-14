@@ -7,22 +7,39 @@ format: any `zstdcat` reads it as a concatenation of frames. The sidecar
 ({archive}.frames.json) enables random-access readers to decompress only the
 frames they need.
 
-Sidecar schema (version 1):
+Sidecar schema (version 2):
     {
-      "version": 1,
+      "version": 2,
       "frame_size": 67108864,
       "zstd_level": 3,
+      "csum_algo": "sha256",
       "total_uncompressed": <int>,
       "total_compressed": <int>,
       "elapsed_seconds": <float>,
       "frame_count": <int>,
       "frames": [{"id": <int>, "uo": <int>, "ul": <int>,
-                  "co": <int>, "cl": <int>}, ...]
+                  "co": <int>, "cl": <int>, "csum": <hex sha256>}, ...]
     }
+
+`csum` is the SHA-256 of the frame's *compressed* bytes as written to disk —
+the digest of exactly the [co, co+cl) byte range. It is computed inline as the
+frame is produced (no extra pass; the bytes are already in hand), so `--verify`
+can confirm an archive's persisted integrity by re-reading and re-hashing each
+frame, with no decompression. `write_checksum=True` additionally embeds zstd's
+own per-frame content checksum, which every decompress (restore, browse,
+recover) verifies automatically. Together they catch corruption introduced
+anywhere from the moment of compression onward (the client write buffer, NFS,
+the network, the storage). Corruption that occurs *before* the SHA-256 is taken
+-- e.g. a bit flip in RAM on a non-ECC host -- is faithfully hashed as-is and
+cannot be detected here; see docs/design/archive-integrity.md.
+
+Schema is backward compatible: v1 sidecars (no `csum`) are still read by the
+seek/extract path, and `--verify` falls back to a full decompress for them.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -87,7 +104,11 @@ def write_framed(
     checking for the partial file's presence after a failed run.
     """
     started = time.monotonic()
-    compressor = zstd.ZstdCompressor(level=zstd_level)
+    # write_checksum embeds zstd's own per-frame content checksum, so every
+    # decompression (restore/browse/recover) self-verifies for free. The
+    # explicit per-frame SHA-256 below additionally enables a decompress-free
+    # --verify against the persisted compressed bytes.
+    compressor = zstd.ZstdCompressor(level=zstd_level, write_checksum=True)
 
     frames: list[dict] = []
     total_uncompressed = 0
@@ -99,9 +120,10 @@ def write_framed(
 
     def snapshot() -> dict:
         return {
-            "version": 1,
+            "version": 2,
             "frame_size": frame_size,
             "zstd_level": zstd_level,
+            "csum_algo": "sha256",
             "total_uncompressed": total_uncompressed,
             "total_compressed": total_compressed,
             "elapsed_seconds": time.monotonic() - started,
@@ -126,6 +148,7 @@ def write_framed(
                     "ul": len(chunk),
                     "co": total_compressed,
                     "cl": len(compressed),
+                    "csum": hashlib.sha256(compressed).hexdigest(),
                 })
 
                 out.write(compressed)

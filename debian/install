@@ -1,6 +1,12 @@
 polkit/com.timetraveller.install-system-crontab.policy usr/share/polkit-1/actions/
 polkit/com.timetraveller.write-system-config.policy usr/share/polkit-1/actions/
+polkit/com.timetraveller.delete-system-archives.policy usr/share/polkit-1/actions/
+polkit/com.timetraveller.run-system-backup.policy usr/share/polkit-1/actions/
+polkit/com.timetraveller.maintain-system-archive.policy usr/share/polkit-1/actions/
 libexec/timetraveller-install-system-cron usr/libexec/
 libexec/timetraveller-write-system-config usr/libexec/
+libexec/timetraveller-delete-system-archives usr/libexec/
+libexec/timetraveller-run-system-backup usr/libexec/
+libexec/timetraveller-maintain-system-archive usr/libexec/
 timetraveller.desktop usr/share/applications/
 timetraveller.png usr/share/icons/hicolor/512x512/apps/

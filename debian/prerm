@@ -1,0 +1,41 @@
+#!/bin/sh
+# Remove TimeTraveller's managed cron blocks when the package is removed, so
+# `apt remove` doesn't leave behind cron entries that invoke a now-deleted
+# binary. Covers root's crontab (system/homes plans) and any user crontab
+# (user plans). Entirely best-effort: a cron hiccup must never block removal.
+set -e
+
+# Strip the marker-delimited managed block(s) from one user's crontab.
+strip_tt_cron() {
+    _user="$1"
+    _cur=$(crontab -u "$_user" -l 2>/dev/null) || return 0
+    case "$_cur" in
+        *"TimeTraveller managed"*) ;;
+        *) return 0 ;;
+    esac
+    printf '%s\n' "$_cur" | awk '
+        /^# >>> TimeTraveller managed:/ { skip=1; next }
+        /^# <<< TimeTraveller managed:/ { skip=0; next }
+        skip != 1 { print }
+    ' | crontab -u "$_user" - 2>/dev/null || true
+}
+
+case "$1" in
+    remove)
+        if command -v crontab >/dev/null 2>&1; then
+            strip_tt_cron root
+            # User-plan crontabs live in the Debian/Ubuntu spool directory.
+            if [ -d /var/spool/cron/crontabs ]; then
+                for _f in /var/spool/cron/crontabs/*; do
+                    [ -e "$_f" ] || continue
+                    _u=$(basename "$_f")
+                    if [ "$_u" = root ]; then continue; fi
+                    strip_tt_cron "$_u"
+                done
+            fi
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+exit 0

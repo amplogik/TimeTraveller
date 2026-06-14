@@ -1,3 +1,85 @@
+timetraveller (1.4.3) unstable; urgency=medium
+
+  * Fix: the last two GUI worker actions that didn't escalate on system-class
+    plans -- reindex (rebuild a missing .idx.zst sidecar) and recover-failed
+    (un-quarantine a failed-but-intact backup). Both run via the archive panel's
+    job tracker as the unprivileged user and would fail writing the root-owned
+    sidecar/manifest. They now self-escalate (_needs_root_escalation) through a
+    new combined pkexec helper timetraveller-maintain-system-archive (+ policy
+    com.timetraveller.maintain-system-archive), which validates the plan
+    allowlist, the action (--reindex/--recover-failed), and a strict archive-
+    filename identifier (charset, no traversal, must end .pax.zst; bare `*`
+    accepted only for --reindex), then re-execs the canonical binary against the
+    root-owned /etc config. Mirror resynced afterward. This closes the
+    "privileged plan + unprivileged GUI" class: backup, delete, schedule,
+    reindex and recover all escalate now.
+
+ -- Kim McCann <amplogik@gmail.com>  Sun, 14 Jun 2026 11:30:00 -0700
+
+timetraveller (1.4.2) unstable; urgency=medium
+
+  * Fix: "Run full now" / "Run incr now" from the GUI on a system-class plan
+    (system/homes) did nothing -- the worker ran as the unprivileged GUI user
+    and crashed with a PermissionError saving the root-owned manifest, after
+    enumerating but before writing any shard. (Scheduled runs were unaffected:
+    cron runs them as root.) Manual backups now escalate via a new pkexec helper
+    (timetraveller-run-system-backup + com.timetraveller.run-system-backup
+    .policy), the same mechanism as the v1.4.1 delete fix: the worker
+    self-escalates for system-class plans when not root, the helper validates
+    the plan allowlist + kind (full/incr/auto) and re-execs the canonical binary
+    against the root-owned /etc config (streams inherited so progress shows
+    live), and the invoking user's manifest mirror is resynced afterward. The
+    shared escalation check is now _needs_root_escalation (covers backup +
+    delete).
+
+ -- Kim McCann <amplogik@gmail.com>  Sun, 14 Jun 2026 11:00:00 -0700
+
+timetraveller (1.4.1) unstable; urgency=medium
+
+  * Fix: deleting a system-class plan's archives (system/homes) from the GUI did
+    nothing -- the worker ran as the unprivileged GUI user and hit a
+    PermissionError on the root-owned archive files (crashing with a raw
+    traceback). Delete now escalates via a new pkexec helper
+    (timetraveller-delete-system-archives + com.timetraveller.delete-system-
+    archives.policy), mirroring how save/schedule already escalate. The helper
+    validates the plan allowlist, the action, and a strict identifier charset
+    (no path traversal / arg smuggling), then re-execs the canonical binary
+    against the root-owned /etc config so deletion stays contained. After a
+    privileged delete the invoking user's local manifest mirror is resynced
+    from the mount so the GUI reflects the change without a manual refresh.
+    --force is forwarded only when the caller passed it, preserving the
+    newest-complete-cycle guard. A residual PermissionError now prints a clean,
+    actionable message instead of a traceback.
+  * Packaging: prerm now strips TimeTraveller's managed cron blocks from root's
+    crontab (system/homes plans) and any user crontab (user plans) on
+    `apt remove`, so uninstalling no longer leaves cron entries that invoke a
+    deleted binary. Best-effort: a cron hiccup never blocks package removal.
+
+ -- Kim McCann <amplogik@gmail.com>  Sun, 14 Jun 2026 10:30:00 -0700
+
+timetraveller (1.4.0) unstable; urgency=medium
+
+  * Archive integrity: per-frame SHA-256, computed inline as each 64 MiB zstd
+    frame is written (no extra pass -- the bytes are already in hand), recorded
+    in the frames.json sidecar (now version 2, csum_algo "sha256"). The frame
+    compressor also enables zstd's own per-frame content checksum, so every
+    decompression (restore/browse/recover) self-verifies automatically. Catches
+    corruption introduced anywhere from compression onward (write buffer, NFS,
+    network, storage) -- a real 8-of-4273-frame corruption on a 2026-06-14 full
+    motivated this. See docs/design/archive-integrity.md (incl. the non-ECC RAM
+    limitation, deliberately out of scope).
+  * --verify reworked: checks integrity by re-reading each frame and comparing
+    its SHA-256 -- no decompression -- and reports the exact corrupt frames. Now
+    shard-group aware (verify a whole logical backup by its stem) and includes
+    quarantined .failed archives. v1 archives fall back to a full decompress.
+  * Fix false "failed" classification: a "file changed as we read it" warning
+    (a benign exit-1 race, e.g. an idle browser's automatic cache cleanup
+    rewriting files mid-read) co-occurring with a vanished-file line on the
+    exit-2 path was wrongly tipping the whole run to failed. Such lines are now
+    recognised as benign, matching the vanished-file (ENOENT) handling.
+
+ -- Kim McCann <amplogik@gmail.com>  Sun, 14 Jun 2026 09:30:00 -0700
+
 timetraveller (1.3.0) unstable; urgency=medium
 
   * Self-describing archives: each shard now gets a <archive>.meta.json sidecar

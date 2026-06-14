@@ -65,7 +65,7 @@ def test_partial_sidecar_survives_midstream_failure(tmp_path):
         "partial sidecar must exist for recovery after a mid-run failure"
 
     payload = json.loads(partial_sidecar.read_text())
-    assert payload["version"] == 1
+    assert payload["version"] == 2
     # The last flush boundary at or before the failure was after frame 4.
     assert payload["frame_count"] >= 4, \
         f"partial sidecar must contain frames up to last flush boundary, got {payload['frame_count']}"

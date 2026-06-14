@@ -75,6 +75,36 @@ def test_pax_two_cannot_open_enoent_is_warnings():
     assert r.status == "ok-with-warnings"
 
 
+# Shard 3 of the 2026-06-14 home full, verbatim from home.s3of4.log: a vanished
+# leveldb file (drives exit to 2) co-occurring with a "file changed as we read
+# it" warning on a rotating log. Each line is benign on its own; the bug was
+# that their *combination* on the exit-2 path tipped the shard — and thus the
+# whole run — to "failed".
+_MIXED_RACE_STDERR = """\
+tar: ./home/kim/.Eigenlabs/3.0.2-beta-3/Log/eigend.0.log: file changed as we read it
+tar: ./home/kim/.config/BraveSoftware/Brave-Browser/Default/IndexedDB/https_www.youtube.com_0.indexeddb.leveldb/001943.log: Cannot stat: No such file or directory
+tar: Exiting with failure status due to previous errors
+"""
+
+
+def test_pax_two_file_changed_with_vanished_is_warnings():
+    """Exit 2 from a vanished file, alongside a 'file changed as we read it'
+    warning, is still benign — both are point-in-time races on volatile files
+    and the stream stays valid. Regression for the 2026-06-14 false failure."""
+    r = _result(2, 0, pax_stderr=_MIXED_RACE_STDERR)
+    assert r.status == "ok-with-warnings"
+    assert r.ok is True
+
+
+def test_pax_two_file_changed_only_is_warnings():
+    """'file changed as we read it' as the sole diagnostic on an exit-2 run is
+    benign on its own too."""
+    stderr = ("tar: ./home/kim/.xsession-errors: file changed as we read it\n"
+              "tar: Exiting with failure status due to previous errors\n")
+    r = _result(2, 0, pax_stderr=stderr)
+    assert r.status == "ok-with-warnings"
+
+
 def test_pax_two_enospc_is_failed():
     """A genuine fatal line among the vanished-file lines keeps it failed."""
     stderr = ("tar: ./home/kim/x: Cannot stat: No such file or directory\n"

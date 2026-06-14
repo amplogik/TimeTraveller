@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "timetraveller"
-version = "1.1.1"
+version = "1.4.3"
 description = "Local Linux backup tool with seekable pax+zstd archives and a PyQt GUI"
 readme = "README.md"
 license = { text = "GPL-3.0-or-later" }
