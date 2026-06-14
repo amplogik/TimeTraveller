@@ -2,7 +2,15 @@
 
 A local Linux backup tool focused on **trustworthy backups** and **fast, partial recovery**.
 
-Status: **v1.0** — initial release.
+Status: **v1.4.3** — stable.
+
+**Highlights since v1.0:**
+
+- **Verifiable integrity** — every archive frame carries a SHA-256 computed inline as it's written (no extra read pass), so corruption introduced anywhere from compression onward (client buffer, NFS, network, storage) is detectable. `--verify` re-checks an archive against those digests *without decompressing it*.
+- **Parallel multi-shard backups** — a backup can be split into N independent shards written concurrently, for substantially higher throughput on multi-core machines. Restores transparently span the shard set.
+- **Full GUI management of system-level backups** — running, deleting, reindexing and recovering `system`/`homes` plans (whose archives are root-owned) all escalate through a single Polkit prompt; no dropping to a root shell.
+- **Tri-state backup status** — `ok` / `ok-with-warnings` / `failed`. Benign races (a browser rewriting its cache mid-backup, a temp file vanishing) are warnings, not failures, so a backup is only flagged failed when the archive is actually untrustworthy.
+- **Archive management** — type-to-confirm delete (by cycle or single backup), group-atomic export, and recovery of a failed-but-intact backup, all from the Archives tab.
 
 ## Why TimeTraveller
 
@@ -33,18 +41,20 @@ The underlying tools — `pax` and `zstd` — already do all of this well. TimeT
 Download the `.deb` from the [latest release](https://github.com/amplogik/TimeTraveller/releases) and install:
 
 ```bash
-sudo apt install ./timetraveller_1.0.0_all.deb
+sudo apt install ./timetraveller_1.4.3_all.deb
 ```
 
 This installs:
 
 - `/usr/bin/timetraveller` — the GUI entry point
 - `/usr/bin/timetraveller-backup` — the CLI worker
-- `/usr/libexec/timetraveller-install-system-cron` — privileged helper for `system` plans
-- `/usr/share/polkit-1/actions/com.timetraveller.install-system-crontab.policy` — Polkit rule that lets the GUI install root crontab entries with one authentication prompt
+- `/usr/libexec/timetraveller-*` — a set of tightly-scoped privileged helpers (write system config, install cron, run backup, delete archives, reindex/recover) that the GUI invokes via `pkexec` for `system`/`homes` plans
+- `/usr/share/polkit-1/actions/com.timetraveller.*.policy` — the matching Polkit rules, each gated by a single (5-minute cached) authentication prompt
 - `/usr/share/applications/timetraveller.desktop` — menu entry under System / Utility
-- `/usr/share/icons/hicolor/256x256/apps/timetraveller.png` — app icon
-- `/etc/timetraveller/` and `/var/lib/timetraveller/` — empty directories for system-wide config and state
+- `/usr/share/icons/hicolor/512x512/apps/timetraveller.png` — app icon
+- `/etc/timetraveller/system.yaml` and `/etc/timetraveller/homes.yaml` — default system-class plans (preserved across upgrades as conffiles)
+
+On removal (`apt remove`), TimeTraveller's managed cron blocks are stripped from root's crontab and any user crontab automatically.
 
 After installation, launch from your application menu or run `timetraveller` from a terminal.
 
@@ -109,14 +119,21 @@ To restore later, pick the plan, switch to the **Archives** tab, browse to the a
 TimeTraveller distinguishes two scopes:
 
 - **User plans** (e.g. `home`) live in `~/.config/timetraveller/<name>.yaml` and run from your user crontab. No root needed.
-- **The system plan** (`system`) lives in `/etc/timetraveller/system.yaml`, runs from root's crontab, and is meant for `/`, `/boot/efi`, etc. — anything you need root to read.
+- **System-class plans** (`system`, `homes`) live in `/etc/timetraveller/<name>.yaml`, run from root's crontab, and are meant for `/`, `/boot/efi`, etc. — anything you need root to read. Their archives and manifest on the backup mount are owned by root.
 
-The GUI can edit a system plan, but writing it back to `/etc` requires root. Two ways to handle this:
+You don't need a root shell to manage system-class plans from the GUI. **Every operation that touches root-owned state escalates through `pkexec`** behind a single (5-minute cached) authentication prompt:
 
-- **From the GUI**: install/uninstall of the system plan's cron entries goes through `pkexec` via the Polkit policy. You'll get a single authentication prompt, then a 5-minute cached auth so consecutive operations don't re-prompt. Editing the system plan's YAML in `/etc` is not yet wired through pkexec — for now, edit `/etc/timetraveller/system.yaml` as root in a text editor and the GUI will pick it up on next launch.
-- **From the CLI**: `sudo timetraveller-backup --plan system --kind full` runs the backup as root with the system plan loaded from `/etc`.
+- Saving the plan's YAML to `/etc`
+- Installing / suspending / removing its schedule in root's crontab
+- **Run full/incr now**
+- **Deleting** a cycle or a single backup
+- **Reindexing** a sidecar or **recovering** a failed-but-intact backup
 
-State written during backups (the on-mount manifest mirror, sidecar mirror, logs) goes to `/var/lib/timetraveller/<plan>/` for root-owned runs and `~/.local/state/timetraveller/<plan>/` for user-owned runs. Both are managed automatically.
+Each is handled by its own narrow, auditable helper under `/usr/libexec/` authorised by a matching Polkit policy — the GUI never runs an arbitrary command as root. (Scheduled backups already run as root from cron, so they were never affected.)
+
+From the CLI, the equivalent is `sudo`, e.g. `sudo timetraveller-backup --plan system --kind full`.
+
+State written during backups (the manifest mirror, sidecar mirror, logs) goes under `~/.local/state/timetraveller/<plan>/` for the user running the job (root's copy for root-owned runs). The GUI reads the invoking user's mirror; after a privileged operation it is resynced automatically, and `--list-archives --refresh-from-mount` rebuilds it from the on-mount manifest if it ever drifts.
 
 ## Help
 
@@ -174,12 +191,31 @@ To restore an *entire* cycle, the command line is more comfortable:
 timetraveller-backup --plan <name> --extract <archive>.pax.zst --into /restore/path .
 ```
 
+### How to manage archives (verify, delete, export, recover)
+
+In the **Archives** tab, right-click a cycle or a single backup for the management actions:
+
+- **Verify** an archive against its per-frame SHA-256 digests — a fast, decompress-free integrity check that names any corrupt frames. Backups also carry zstd's own per-frame checksum, so a normal browse or restore self-verifies as it reads.
+- **Delete** a cycle or a single backup. Deletion is type-to-confirm and discloses the blast radius (how many shards, and any dependent incrementals); it refuses the newest complete cycle unless you confirm.
+- **Export** a whole backup or cycle as a self-contained bundle (every shard + sidecars + a manifest slice) to another directory — handy for offlining a copy to a USB drive.
+- **Recover** a backup the status column shows as **failed**: if its compressed stream is actually intact (the common case is a file that vanished mid-walk), recovery re-reads it as proof, rebuilds the sidecar, and flips it back to `ok-with-warnings`.
+
+For `system`/`homes` plans these all go through a single Polkit prompt (see *Sudo and system plans* above).
+
+### Backup status: ok / ok-with-warnings / failed
+
+A live filesystem changes under a snapshot-less backup — a browser rewrites a cache file, a build drops a temp file — and `tar`/`pax` reports those as per-file warnings. TimeTraveller classifies a run by what actually happened to the archive:
+
+- **ok** — clean.
+- **ok-with-warnings** — some files were skipped (vanished or changed mid-read), but the archive stream is structurally valid and trustworthy. This is normal for a busy home directory.
+- **failed** — the archive itself is not trustworthy (a fatal error, a compression failure, or unreadable diagnostics). Only these are treated as failures; retention won't prune around them, and the file is quarantined for `--recover-failed`.
+
 ## Architecture
 
-- Each backup is a **pax archive compressed with zstd**, written to `<destination>/<hostname>/<plan>/<date>_<kind>.pax.zst`.
-- Alongside each archive sits a **sidecar** (`.idx.zst`) holding a sorted index of every entry's name and byte offset. Single-file restore reads only the relevant bytes — extracting one file from a 200 GB archive takes seconds, not minutes.
-- Cycles are tracked in a `manifest.json` next to the archives. A local mirror under `~/.local/state/timetraveller/` (or `/var/lib/timetraveller/` for system plans) lets the GUI draw its list without blocking on the backup mount.
-- Schedules are stored in your crontab inside a managed marker block. The block is the only thing TimeTraveller edits — anything else in your crontab is preserved verbatim.
+- Each backup is a **pax archive compressed with zstd**, written to `<destination>/<hostname>/<plan>/<date>_<kind>.pax.zst`. A backup may be split into **shards** (`…<date>_<kind>.sNofM.pax.zst`) written concurrently — one logical backup, M files; the GUI and restore treat the set as a unit.
+- The archive is a **sequence of independent 64 MiB zstd frames**. A `.frames.json` sidecar records each frame's byte offset, length, and **SHA-256** (built inline during the write — no second pass), and a `.idx.zst` sidecar holds a sorted index of every entry's name and byte offset. Together they make single-file restore read only the relevant bytes — extracting one file from a 200 GB archive takes seconds — and let `--verify` confirm integrity by re-hashing frames without decompressing.
+- Cycles are tracked in a `manifest.json` next to the archives (plus a per-shard `.meta.json`). A local mirror under `~/.local/state/timetraveller/` lets the GUI draw its list without blocking on the backup mount.
+- Schedules are stored in your crontab inside a managed marker block. The block is the only thing TimeTraveller edits — anything else in your crontab is preserved verbatim, and it's removed cleanly on `apt remove`.
 
 ## Command-line tool
 
@@ -192,11 +228,22 @@ timetraveller-backup --plan home --kind full
 # List cycles on disk
 timetraveller-backup --plan home --list-archives
 
+# Verify an archive's integrity (decompress-free, per-frame SHA-256).
+# Accepts a whole sharded backup by its stem, e.g. 2026-06-14_full
+timetraveller-backup --plan home --verify 2026-06-14_full
+
 # Apply retention now (without taking a new backup)
 timetraveller-backup --plan home --prune
 
-# Restore a single path
-timetraveller-backup --plan home --extract <archive>.pax.zst ./path/within --into /tmp/restored
+# Restore a single path (resolves across shards automatically)
+timetraveller-backup --plan home --extract 2026-06-14_full ./path/within --into /tmp/restored
+
+# Delete one cycle, or export a whole backup as a self-contained bundle
+timetraveller-backup --plan home --delete-cycle 2026-06-14 --force
+timetraveller-backup --plan home --export-set 2026-06-14_full --into /mnt/usb
+
+# Recover a backup marked "failed" whose stream is actually intact
+timetraveller-backup --plan home --recover-failed 2026-06-14_full.s3of4.pax.zst
 
 # Dry-run: walk the source tree and report what would be backed up
 timetraveller-backup --plan home --dry-run --kind full
@@ -205,11 +252,14 @@ timetraveller-backup --plan home --dry-run --kind full
 timetraveller-backup --plan home --show-mounts
 ```
 
+Shard count is set per plan (the **Streams** control on the Plan tab, or `shards:` in the YAML — an integer or `auto`). More shards trade CPU for throughput up to your storage backend's write ceiling.
+
 ## Troubleshooting
 
 - **Plan doesn't appear in the sidebar** — check that the YAML in `~/.config/timetraveller/` (or `/etc/timetraveller/` for `system`) parses cleanly. The GUI's status bar shows which files were skipped on startup.
 - **Schedule won't install** — check `crontab -l` for a managed block. Plan names must match `[A-Za-z0-9_-]+` to install (the New Plan dialog enforces this).
-- **Restore says "archive not found"** — the file on the backup mount was deleted outside TimeTraveller. The manifest still references it. Restore from another backup, or remove the manifest entry manually (a future release will detect and surface this in the GUI).
+- **Restore says "archive not found"** — the file on the backup mount was deleted outside TimeTraveller while the manifest still references it. Restore from another backup, or run `--list-archives --refresh-from-mount` to reconcile the manifest with what's actually on the mount.
+- **Archives tab empty for a `system`/`homes` plan** ("no archives in local mirror") — these plans back up as root, so their local manifest mirror belongs to root, not your GUI user. Run `timetraveller-backup --plan system --list-archives --refresh-from-mount` once to rebuild your user's mirror from the on-mount manifest (it reads the mount; it never writes the root-owned copy). The GUI also resyncs automatically after any privileged operation.
 - **GUI hangs on slow NFS** — the GUI is designed to avoid blocking on the backup mount, but a stalled mount can still affect things like the Archives tab refresh. Local mirror state is the fallback path.
 
 ## Contributing
