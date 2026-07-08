@@ -86,6 +86,12 @@ class PlanConfig:
     framed: bool = True
     extra_pax_flags: list[str] = field(default_factory=list)
     shards: int | str = "auto"   # parallel write streams per backup; "auto" or int>=1
+    # Verify each shard's frame checksums immediately after writing it, by
+    # re-reading from the backup store (cache-dropped) before trusting the
+    # backup. Catches post-write corruption (e.g. non-ECC bit flips in the
+    # RAM→NIC→NAS path) the same night instead of years later at restore.
+    # Overlaps with sibling-shard writes, so the wall-clock cost is small.
+    verify_after_write: bool = True
 
     def configured_shards(self) -> int:
         """Resolve `shards` to a concrete count ("auto" -> a CPU-based default).

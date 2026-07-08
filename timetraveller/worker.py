@@ -18,10 +18,12 @@ from . import archive as archivelib
 from . import config as configlib
 from . import extract as extractlib
 from . import framewriter
+from . import heal as heallib
 from . import index as indexlib
 from . import manifest as manifestlib
 from . import mounts as mountslib
 from . import pax as paxlib
+from . import restore_source as restoresrc
 from . import retention as retentionlib
 from . import schedule as schedulelib
 
@@ -91,6 +93,12 @@ def build_parser() -> argparse.ArgumentParser:
                               "a trailing slash means subtree. Uses .idx.zst + .frames.json "
                               "sidecars when available for fast random-access extraction; "
                               "falls back to whole-archive scan otherwise.")
+    actions.add_argument("--heal", type=str, default=None, metavar="ARCHIVE",
+                         help="D2 recovery: find files damaged by verify-detected frame "
+                              "corruption in the named backup and restore a clean copy of "
+                              "each from another cycle that still holds one. Writes recovered "
+                              "files into --into (default: cwd). Reports any file with no "
+                              "clean copy anywhere as unrecoverable.")
     actions.add_argument("--prune", action="store_true",
                          help="Apply retention without taking a new backup.")
     actions.add_argument("--delete-cycle", metavar="CYCLE_ID", default=None,
@@ -330,6 +338,20 @@ def _save_manifest(m: manifestlib.Manifest, archive_dir: Path, plan_name: str) -
         print(f"WARNING: manifest mirror write failed: {e}", file=sys.stderr)
 
 
+def _write_restore_descriptor(archive_dir: Path, plan: configlib.PlanConfig) -> None:
+    """Best-effort: write the self-describing restore descriptor next to the
+    manifest so a config-less restore (fresh install / USB drive) can recover
+    the plan's identity and original source roots. A failure here must never
+    fail the backup — the descriptor is derived data (--refresh-from-mount
+    backfills it), and the manifest alone still supports extract-to-a-dir."""
+    from . import __version__
+    try:
+        desc = restoresrc.from_plan(plan, created_by=f"timetraveller {__version__}")
+        restoresrc.write_descriptor(archive_dir, desc)
+    except OSError as e:
+        print(f"WARNING: restore descriptor write failed: {e}", file=sys.stderr)
+
+
 def _mirror_sidecar(plan_name: str, source_sidecar: Path,
                     archive_filename: str) -> None:
     """Best-effort copy of an on-mount sidecar into the local mirror.
@@ -377,6 +399,59 @@ def _write_entry_meta(archive_dir: Path, m: manifestlib.Manifest,
         manifestlib.write_entry_meta(archive_dir, entry)
     except OSError as e:
         print(f"WARNING: {fname}: meta sidecar write failed: {e}", file=sys.stderr)
+
+
+def _verify_shard_after_write(archive_path: Path, plan: configlib.PlanConfig) -> list[dict]:
+    """D1: re-read a just-written shard from the store (cache-dropped) and return
+    its bad frame records — [] if verify is disabled, the archive is unframed, or
+    it verifies clean. A read error is logged and treated as 'not verified' ([]),
+    never as corruption, so a transient NFS hiccup can't fail an otherwise-good
+    backup.
+
+    Runs inside the shard's writer thread so it overlaps sibling-shard writes;
+    the cache-drop makes it read what actually LANDED, not the client buffer."""
+    if not plan.verify_after_write:
+        return []
+    try:
+        res = heallib.verify_frame_checksums(archive_path, drop_cache=True)
+    except Exception as e:  # noqa: BLE001 - a verify safety-net must NEVER fail an
+        # otherwise-good backup: any error here (read hiccup, malformed sidecar)
+        # is treated as "not verified", logged, and the backup stands.
+        print(f"WARNING: {archive_path.name}: verify-after-write error: {e}; "
+              f"shard not verified", file=sys.stderr)
+        return []
+    if res is None:
+        return []  # unframed / legacy: no per-frame csums to check
+    _algo, _n, bad = res
+    return bad
+
+
+def _mark_corrupt_shards(m: manifestlib.Manifest, archive_dir: Path,
+                         specs: list, verify_bad: list, args: argparse.Namespace) -> int:
+    """Fold verify-after-write results into the manifest: flag every shard with
+    bad frames as `corrupt`, record the count + the affected files, and rewrite
+    its .meta.json. Returns the number of corrupt shards. The archive files are
+    left in place — they stay browsable/extractable so the good frames restore
+    and D2 (--heal) can recover the damaged files from another cycle."""
+    ncorrupt = 0
+    for (sfname, sapath, _files, _slog), bad in zip(specs, verify_bad):
+        if not bad:
+            continue
+        ncorrupt += 1
+        files = heallib.frames_to_files(sapath, [fr["id"] for fr in bad])
+        shown = ", ".join(files[:8]) + (f" (+{len(files) - 8} more)" if len(files) > 8 else "")
+        note = (f"verify-after-write: {len(bad)} corrupt frame(s) affecting "
+                f"{len(files)} file(s): {shown}")
+        entry = next((e for e in m.archives if e.filename == sfname), None)
+        if entry is not None:
+            entry.status = "corrupt"
+            entry.corrupt_frames = len(bad)
+            entry.notes = f"{entry.notes}; {note}" if entry.notes else note
+            _write_entry_meta(archive_dir, m, sfname, args)
+        print(f"ERROR: {sfname}: {note}", file=sys.stderr)
+        _log(args, f"CORRUPT: {sfname}: {len(bad)} bad frame(s), "
+                   f"{len(files)} file(s) affected")
+    return ncorrupt
 
 
 def _finalize_one(m: manifestlib.Manifest, archive_path: Path, fname: str,
@@ -481,6 +556,9 @@ def action_list_archives(args: argparse.Namespace, plan: configlib.PlanConfig) -
         # and update the mirror directly.
         try:
             _save_manifest(on_mount, archive_dir, plan.plan_name)
+            # Backfill the self-describing descriptor for pre-existing backups
+            # while we're already touching the mount with write intent.
+            _write_restore_descriptor(archive_dir, plan)
         except PermissionError:
             print(f"NOTE: on-mount manifest not writable as this user; "
                   f"updating local mirror only.", file=sys.stderr)
@@ -913,33 +991,16 @@ def _resolve_verify_targets(archive_dir: Path, identifier: str) -> list[Path]:
 def _verify_frames(archive_path: Path) -> tuple[str, int, list[dict]] | None:
     """Decompress-free integrity check using the v2 frames.json `csum` digests.
 
-    Re-reads each frame's persisted compressed bytes and compares their hash to
-    the digest recorded at write time. Returns (algo, frame_count, bad_frames)
-    where each bad frame is {id, uo, ul}, or None if no v2 (csum-bearing)
-    sidecar exists — the caller then falls back to a full decompress.
+    Thin wrapper over heal.verify_frame_checksums that narrows each bad frame to
+    the {id, uo, ul} shape action_verify reports. Returns (algo, frame_count,
+    bad_frames), or None if no v2 (csum-bearing) sidecar exists — the caller
+    then falls back to a full decompress.
     """
-    import hashlib
-    import json
-    sidecar = framewriter.sidecar_path(archive_path)
-    if not sidecar.exists():
+    res = heallib.verify_frame_checksums(archive_path)
+    if res is None:
         return None
-    try:
-        meta = json.loads(sidecar.read_text())
-    except (OSError, ValueError):
-        return None
-    frames = meta.get("frames") or []
-    if not frames or "csum" not in frames[0]:
-        return None  # v1 sidecar: no per-frame digests
-    algo = meta.get("csum_algo", "sha256")
-    bad: list[dict] = []
-    with open(archive_path, "rb") as f:
-        for fr in frames:
-            co, cl = fr["co"], fr["cl"]
-            f.seek(co)
-            data = f.read(cl)
-            if len(data) != cl or hashlib.new(algo, data).hexdigest() != fr["csum"]:
-                bad.append({"id": fr["id"], "uo": fr["uo"], "ul": fr["ul"]})
-    return (algo, len(frames), bad)
+    algo, nframes, bad = res
+    return (algo, nframes, [{"id": fr["id"], "uo": fr["uo"], "ul": fr["ul"]} for fr in bad])
 
 
 def action_verify(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
@@ -988,6 +1049,73 @@ def action_verify(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
         else:
             print(f"verify: {archive.name} OK (full decompress)")
     return 0 if overall_ok else 1
+
+
+def _archives_newest_first(archive_dir: Path, m: manifestlib.Manifest,
+                           exclude: set[str]) -> list[Path]:
+    """On-disk archive paths for every manifest entry not in `exclude`, newest
+    backup first — the search order for a clean replacement copy."""
+    out: list[Path] = []
+    for e in sorted(m.archives, key=lambda e: e.date_started, reverse=True):
+        if e.filename in exclude:
+            continue
+        p = archive_dir / e.filename
+        if p.exists():
+            out.append(p)
+    return out
+
+
+def action_heal(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
+    """D2: recover files damaged by frame corruption in one backup by pulling a
+    clean copy of each from another cycle that still holds one."""
+    archive_dir = plan.archive_dir()
+    targets = _resolve_verify_targets(archive_dir, args.heal)
+    if not targets:
+        print(f"archive not found: {archive_dir / args.heal}", file=sys.stderr)
+        return 1
+    into = args.into if args.into is not None else Path.cwd()
+
+    m = manifestlib.load(manifestlib.manifest_path(archive_dir))
+    by_name = {e.filename: e for e in m.archives}
+
+    def _bare(name: str) -> str:
+        return name[:-len(".failed")] if name.endswith(".failed") else name
+
+    # Verify the shards D1 already flagged corrupt; if none are flagged (e.g. a
+    # pre-D1 backup the user suspects), fall back to verifying all its shards.
+    flagged = [t for t in targets
+               if getattr(by_name.get(_bare(t.name)), "corrupt_frames", 0)]
+    to_check = flagged or targets
+
+    damaged: dict[str, str] = {}   # member -> the shard it is damaged in
+    for t in to_check:
+        for member in heallib.damaged_files(t, drop_cache=True):
+            damaged.setdefault(member, t.name)
+    if not damaged:
+        _log(args, f"--heal: no detectable corruption in {args.heal}; nothing to heal.")
+        return 0
+
+    _log(args, f"--heal: {len(damaged)} damaged file(s) in {args.heal}:")
+    for member in sorted(damaged):
+        _log(args, f"    {member}  (corrupt in {damaged[member]})")
+
+    candidates = _archives_newest_first(archive_dir, m, {t.name for t in targets})
+    res = heallib.heal_files(sorted(damaged), into=into, candidate_archives=candidates)
+
+    for member, src in res.healed.items():
+        _log(args, f"  RECOVERED  {member}  ←  {src}")
+    for member in res.unrecoverable:
+        print(f"  UNRECOVERABLE: {member} — no clean copy in any other cycle",
+              file=sys.stderr)
+    _log(args, f"--heal: recovered {len(res.healed)}/{len(damaged)} file(s) "
+               f"({res.bytes_written/1024**2:.1f} MiB) → {into}")
+    if res.unrecoverable:
+        print(f"--heal: {len(res.unrecoverable)} file(s) have no clean copy in this "
+              f"backup set. If you have another copy of these backups (another disk, "
+              f"an older export), mount it and re-run --heal with --into pointing there.",
+              file=sys.stderr)
+        return 2
+    return 0
 
 
 def action_prune(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
@@ -1898,14 +2026,22 @@ def action_backup(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
         return paxlib.run_with_file_list(inv, iter(files), log_file=slog)
 
     results: list = [None] * n
+    # verify_bad[i] holds shard i's bad-frame records (empty = clean/not-verified).
+    # Each shard verifies in its own writer thread the instant its write returns,
+    # so the re-read overlaps sibling shards still writing (measured ~free).
+    verify_bad: list = [[] for _ in range(n)]
     if n == 1:
         results[0] = _run_spec(specs[0])
+        if results[0].status in ("ok", "ok-with-warnings"):
+            verify_bad[0] = _verify_shard_after_write(specs[0][1], plan)
     else:
         errs: dict = {}
 
         def _worker(i):
             try:
                 results[i] = _run_spec(specs[i])
+                if results[i].status in ("ok", "ok-with-warnings"):
+                    verify_bad[i] = _verify_shard_after_write(specs[i][1], plan)
             except BaseException as exc:  # noqa: BLE001 - surface after join
                 errs[i] = exc
 
@@ -1919,12 +2055,17 @@ def action_backup(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
 
     statuses = [_finalize_one(m, sapath, sfname, result, plan, args, slog)
                 for (sfname, sapath, _files, slog), result in zip(specs, results)]
+    # Fold in verify-after-write: any shard with bad frames becomes `corrupt`.
+    ncorrupt = _mark_corrupt_shards(m, archive_dir, specs, verify_bad, args)
     _save_manifest(m, archive_dir, plan.plan_name)
+    _write_restore_descriptor(archive_dir, plan)
 
-    # Retention only runs on a clean backup — a partially-failed shard set is an
-    # incomplete cycle and is protected anyway, but skip pruning after failure.
+    # Retention runs only on a fully clean backup. Skip it after a failure OR
+    # any corruption — a corrupt cycle is an untrustworthy base, and pruning the
+    # PREVIOUS (good) cycle would destroy the redundancy D2 heals from.
     any_failed = "failed" in statuses
-    if not any_failed and not args.no_retention:
+    any_corrupt = ncorrupt > 0
+    if not any_failed and not any_corrupt and not args.no_retention:
         action_prune(argparse.Namespace(**vars(args)), plan)
 
     total = (datetime.now(timezone.utc) - now).total_seconds()
@@ -1933,6 +2074,14 @@ def action_backup(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
         print(f"ERROR: {nfailed} of {n} shard(s) failed; see {log_path}*",
               file=sys.stderr)
         _log(args, f"Backup INCOMPLETE ({nfailed}/{n} shard(s) failed): "
+                   f"{_hms(total)} total.")
+        return 1
+    if any_corrupt:
+        print(f"ERROR: verify-after-write found corruption in {ncorrupt} of {n} "
+              f"shard(s). The backup is browsable and the good frames restore, but "
+              f"the cycle is INCOMPLETE — recover the damaged files from another "
+              f"cycle with:  --heal {stem}", file=sys.stderr)
+        _log(args, f"Backup INCOMPLETE ({ncorrupt}/{n} shard(s) corrupt): "
                    f"{_hms(total)} total.")
         return 1
     _log(args, f"Backup complete: {_hms(total)} total.")
@@ -2005,6 +2154,8 @@ def main(argv: list[str] | None = None) -> int:
         return action_verify(args, plan)
     if args.extract:
         return action_extract(args, plan)
+    if args.heal:
+        return action_heal(args, plan)
     if args.prune:
         return action_prune(args, plan)
     if args.delete_cycle:

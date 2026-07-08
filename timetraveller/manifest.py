@@ -34,6 +34,11 @@ class ArchiveEntry:
     incr_window_to: str = ""    # ISO 8601, for incremental archives
     file_count: int | None = None
     notes: str = ""
+    # Count of frames that failed their checksum at verify-after-write time. >0
+    # means the stream wrote cleanly but some persisted bytes are corrupt (a
+    # post-write bit flip); the archive stays browsable/extractable so the good
+    # frames restore and D2 can heal the damaged files from another cycle.
+    corrupt_frames: int = 0
     has_sidecar: bool = False   # True if the .idx.zst sidecar exists for this archive
     has_frames: bool = False    # True if the .frames.json sidecar exists (framed-zstd archive)
     # Sharding: one logical backup may be split across N archive files ("shards"),
@@ -134,13 +139,16 @@ class ShardSet:
     @property
     def status(self) -> str:
         """Aggregate status: failed if any shard failed, in-progress if any is
-        still running, empty if all shards were empty, warnings if any shard
-        had warnings, else ok."""
+        still running, corrupt if any shard has verify-detected bad frames,
+        empty if all shards were empty, warnings if any shard had warnings,
+        else ok."""
         sts = {m.status for m in self.members}
         if "failed" in sts:
             return "failed"
         if "in-progress" in sts:
             return "in-progress"
+        if "corrupt" in sts or any(m.corrupt_frames for m in self.members):
+            return "corrupt"
         if sts == {"empty"}:
             return "empty"
         if "ok-with-warnings" in sts:
@@ -149,10 +157,13 @@ class ShardSet:
 
     @property
     def is_complete(self) -> bool:
-        """Complete iff EVERY shard succeeded (ok/ok-with-warnings). A single
-        failed shard makes the whole logical backup incomplete."""
+        """Complete iff EVERY shard succeeded cleanly (ok/ok-with-warnings) with
+        no verify-detected corruption. A single failed OR corrupt shard makes the
+        whole logical backup incomplete — so retention protects it and it is not
+        trusted as a clean cycle base."""
         return bool(self.members) and all(
-            m.status in ("ok", "ok-with-warnings") for m in self.members)
+            m.status in ("ok", "ok-with-warnings") and not m.corrupt_frames
+            for m in self.members)
 
 
 def group_into_sets(entries: list[ArchiveEntry]) -> list[ShardSet]:

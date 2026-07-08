@@ -84,6 +84,13 @@ class MainWindow(QMainWindow):
                               "--list-archives"]))
         tb.addAction(self._archives_act)
 
+        self._restore_loc_act = QAction("Restore from location…", self)
+        self._restore_loc_act.setToolTip(
+            "Browse to a backup on a USB drive, external disk, or network share "
+            "and restore from it directly — no matching plan config needed.")
+        self._restore_loc_act.triggered.connect(self._open_restore_from_location)
+        tb.addAction(self._restore_loc_act)
+
         self._help_act = QAction("Help", self)
         self._help_act.setShortcut(QKeySequence.StandardKey.HelpContents)
         self._help_act.triggered.connect(self._show_help)
@@ -167,6 +174,28 @@ class MainWindow(QMainWindow):
             self._plan_list.setCurrentRow(0)
         else:
             self._set_actions_enabled(False)
+            self._nudge_restore_from_location()
+
+    def _open_restore_from_location(self, initial_dir: str | None = None) -> None:
+        from .restore_location_dialog import RestoreFromLocationDialog
+        dlg = RestoreFromLocationDialog(self, initial_dir=initial_dir or None)
+        dlg.exec()
+
+    def _nudge_restore_from_location(self) -> None:
+        """No plans configured — e.g. a fresh install after a system restore.
+        Point the user at restore-from-location rather than leaving them at an
+        empty window. Deliberately does NOT stat any backup mount (that could
+        stall the UI thread on a hard NFS mount); it fires purely on the absence
+        of local config."""
+        QMessageBox.information(
+            self, "No backup plans yet",
+            "There are no backup plans configured on this machine yet.<br><br>"
+            "If you're here to <b>restore</b> from existing backups (a fresh "
+            "install, a new machine, or a rescued drive), click "
+            "<b>Restore from location…</b> in the toolbar and browse to where your "
+            "backups live — a mounted USB drive, an external disk, or a network "
+            "share. No configuration is needed to restore.",
+        )
 
     # ---------- plan discovery + selection ----------
 

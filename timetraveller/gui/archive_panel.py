@@ -22,11 +22,11 @@ from PyQt6.QtWidgets import (
 
 from .. import manifest as manifestlib
 from ..archive import (
-    CycleListing, IndexNode, list_from_manifest, load_sidecar_tree,
-    merge_sidecar_trees,
+    CycleListing, IndexNode, list_for_plan, list_from_manifest,
+    load_sidecar_tree, merge_sidecar_trees,
 )
 from ..config import PlanConfig
-from ..index import sidecar_mirror_path
+from ..index import sidecar_mirror_path, sidecar_path
 from ..manifest import ArchiveEntry
 from .archive_tree_model import ArchiveTreeModel
 from .delete_dialog import DeleteConfirmDialog, cycle_token, set_token
@@ -85,6 +85,13 @@ class ArchivePanel(QWidget):
         self._pending_group: str | None = None
         self._tracker = tracker
         self._recover_tracker = recover_tracker
+        # Source mode: when set, the panel browses a directory the user pointed
+        # at (a mounted USB drive, an NFS/SMB share) INSTEAD of an installed
+        # plan's local mirror — reading the manifest + sidecars straight from
+        # `_source_dir`. This is how restore-from-anywhere works with no local
+        # config. Never touches the mirror in this mode (so no plan_name clash).
+        self._source_dir: Path | None = None
+        self._source_name: str = ""
 
         layout = QVBoxLayout(self)
 
@@ -179,32 +186,89 @@ class ArchivePanel(QWidget):
 
     # ---------- plan switching ----------
 
+    # ---------- source resolution (plan-mirror vs browsed directory) ----------
+
+    def _in_source_mode(self) -> bool:
+        return self._source_dir is not None
+
+    def _adir(self) -> Path | None:
+        """The directory archives are read from: the browsed source dir in
+        source mode, else the active plan's archive dir."""
+        if self._source_dir is not None:
+            return self._source_dir
+        return self._plan.archive_dir() if self._plan else None
+
+    def _pname(self) -> str:
+        if self._source_dir is not None:
+            return self._source_name or self._source_dir.name
+        return self._plan.plan_name if self._plan else ""
+
+    def _load_listing(self):
+        """Cycle listing for the current source. Source mode reads the browsed
+        manifest directly (mount access is expected); plan mode reads the mirror."""
+        if self._source_dir is not None:
+            return list_for_plan(self._source_dir)
+        return list_from_manifest(self._plan.plan_name, self._plan.archive_dir())
+
+    def _shard_sidecar_path(self, filename: str) -> Path:
+        """Where to read a shard's .idx.zst: straight from the source dir in
+        source mode (no mirror exists for a browsed location), else the mirror."""
+        if self._source_dir is not None:
+            return sidecar_path(self._source_dir / filename)
+        return sidecar_mirror_path(self._plan.plan_name, filename)
+
+    def _shard_has_sidecar(self, m: ArchiveEntry) -> bool:
+        """Source mode stats the real sidecar (the browsed manifest's flag may
+        be stale); plan mode trusts the manifest's has_sidecar flag."""
+        if self._source_dir is not None:
+            return self._shard_sidecar_path(m.filename).exists()
+        return m.has_sidecar
+
     def load_plan(self, plan: PlanConfig) -> None:
+        self._source_dir = None
+        self._source_name = ""
         self._plan = plan
         self.refresh()
 
-    def refresh(self) -> None:
-        """Reload the archive list from the local manifest mirror.
+    def load_source(self, archive_dir: Path, plan_name: str,
+                    sources: list[str] | None = None) -> None:
+        """Browse a backup directory directly (USB/NFS/SMB), independent of any
+        local config or mirror. `archive_dir` is read as-is; `plan_name`/`sources`
+        come from the location's descriptor (identity + restore-to targets)."""
+        self._source_dir = Path(archive_dir)
+        self._source_name = plan_name
+        # A synthetic plan satisfies the panel's `self._plan` guards and carries
+        # the display name + restore-to sources. Its archive_dir() is never used
+        # in source mode — every read routes through _adir()/_shard_sidecar_path.
+        self._plan = PlanConfig(
+            plan_name=plan_name or self._source_dir.name,
+            sources=sources or ["/"],
+            destination=str(self._source_dir))
+        self.refresh()
 
-        Touches no mount-backed path. If the mirror is empty (never refreshed),
-        the panel shows a placeholder pointing the user at the CLI.
+    def refresh(self) -> None:
+        """Reload the archive list.
+
+        Plan mode reads the local manifest mirror (never touches the mount).
+        Source mode reads the browsed directory's manifest directly — the user
+        explicitly pointed us there, so touching it is expected.
         """
         self._archive_list.clear()
         self._set_file_tree(None)
         if not self._plan:
             self._search_widget.set_plan("", [])
             return
-        listing = list_from_manifest(self._plan.plan_name, self._plan.archive_dir())
+        listing = self._load_listing()
         all_entries: list[ArchiveEntry] = []
         for c in listing.cycles:
             all_entries.extend(c.archives)   # every shard, so all are searchable
-        self._search_widget.set_plan(self._plan.plan_name, all_entries)
+        self._search_widget.set_plan(self._pname(), all_entries)
         if not listing.cycles:
-            placeholder = QTreeWidgetItem([
-                "(no archives in local mirror — run "
-                "`timetraveller-backup --plan <name> --list-archives --refresh-from-mount`)",
-                "", "",
-            ])
+            msg = ("(no backups found in this location)" if self._in_source_mode()
+                   else "(no archives in local mirror — run "
+                        "`timetraveller-backup --plan <name> --list-archives "
+                        "--refresh-from-mount`)")
+            placeholder = QTreeWidgetItem([msg, "", ""])
             placeholder.setFlags(placeholder.flags() & ~Qt.ItemFlag.ItemIsSelectable)
             self._archive_list.addTopLevelItem(placeholder)
             return
@@ -230,6 +294,17 @@ class ArchivePanel(QWidget):
             if s.status == "failed":
                 child.setForeground(0, _color("#cf222e"))
                 child.setForeground(2, _color("#cf222e"))
+            elif s.status == "corrupt":
+                # Distinct from failed-red: the backup wrote fine but some
+                # persisted frames are corrupt. The good data still restores.
+                child.setForeground(0, _color("#bc4c00"))
+                child.setForeground(2, _color("#bc4c00"))
+                nbad = sum(m.corrupt_frames for m in s.members)
+                tip = (f"{nbad} corrupt frame(s) found by verify-after-write. The "
+                       f"undamaged data still restores; right-click → Recover damaged "
+                       f"files to pull clean copies from another cycle.")
+                child.setToolTip(0, tip)
+                child.setToolTip(2, tip)
             elif s.status == "empty":
                 child.setForeground(0, _color("#6e7781"))
             elif s.status == "orphan":
@@ -250,7 +325,7 @@ class ArchivePanel(QWidget):
             return
 
         # Every shard must be indexed before we can show the merged tree.
-        if not all(m.has_sidecar for m in s.members):
+        if not all(self._shard_has_sidecar(m) for m in s.members):
             self._show_no_sidecar(s)
             self._set_file_tree(None)
             self._pending_group = None
@@ -259,14 +334,17 @@ class ArchivePanel(QWidget):
         self._reindex_btn.setVisible(False)
         self._recover_btn.setVisible(False)
 
-        # All shards' sidecars must be in the local mirror.
+        # Resolve each shard's sidecar (mirror in plan mode, the browsed dir in
+        # source mode). All must be present to render the merged tree.
         sidecars = []
         for m in s.members:
-            sc = sidecar_mirror_path(self._plan.plan_name, m.filename)
+            sc = self._shard_sidecar_path(m.filename)
             if not sc.exists():
+                where = ("the backup location" if self._in_source_mode()
+                         else "the local mirror (run "
+                               "<code>--list-archives --refresh-from-mount</code>)")
                 self._archive_label.setText(
-                    f"<b>{_set_label(s)}</b> — a sidecar is missing from the local "
-                    f"mirror (run <code>--list-archives --refresh-from-mount</code>)"
+                    f"<b>{_set_label(s)}</b> — a sidecar is missing from {where}"
                 )
                 self._set_file_tree(None)
                 self._pending_group = None
@@ -370,6 +448,11 @@ class ArchivePanel(QWidget):
         contextual buttons for discoverability)."""
         if self._plan is None:
             return
+        # Source mode is read-only recovery: no delete/export/reindex/refresh,
+        # which mutate state or assume the local mirror. Extraction is via the
+        # bottom "Extract selected…" button.
+        if self._in_source_mode():
+            return
         item = self._archive_list.itemAt(pos)
         menu = QMenu(self)
         data = None
@@ -383,6 +466,9 @@ class ArchivePanel(QWidget):
             elif (not all(m.has_sidecar for m in s.members)
                   and self._tracker is not None):
                 menu.addAction("Reindex (rebuild sidecar)", self._on_reindex_clicked)
+            if s.status == "corrupt":
+                menu.addAction("Recover damaged files (heal)…",
+                               lambda: self._heal_set(s))
             menu.addAction("Export backup…", lambda: self._export_set(s))
             menu.addAction("Delete backup…", lambda: self._delete_set(s))
         elif isinstance(data, CycleListing):
@@ -422,12 +508,24 @@ class ArchivePanel(QWidget):
     def _export_set(self, s: manifestlib.ShardSet) -> None:
         self._export_into("--export-set", s.group_id, f"backup {s.group_id}")
 
+    def _heal_set(self, s: manifestlib.ShardSet) -> None:
+        """D2: recover the files damaged by frame corruption in this backup,
+        pulling clean copies from another cycle, into a chosen directory."""
+        if self._plan is None:
+            return
+        target = QFileDialog.getExistingDirectory(
+            self, "Recover damaged files into…")
+        if not target:
+            return
+        self.worker_requested.emit(
+            f"Heal {s.group_id}", ["--heal", s.group_id, "--into", target])
+
     def _export_cycle(self, cycle: CycleListing) -> None:
         self._export_into("--export-cycle", cycle.cycle_id, f"cycle {cycle.cycle_id}")
 
     def _listing(self):
-        """Current archive listing from the local mirror (no mount access)."""
-        return list_from_manifest(self._plan.plan_name, self._plan.archive_dir())
+        """Current archive listing (mirror in plan mode, browsed dir in source)."""
+        return self._load_listing()
 
     def _newest_complete_cycle_id(self) -> str | None:
         complete = sorted(c.cycle_id for c in self._listing().cycles
@@ -701,8 +799,9 @@ class ArchivePanel(QWidget):
         if not paths:
             return
         # Extraction is a deliberate, user-initiated mount touch. Restore from
-        # all shards of the logical backup; each holds a disjoint subset.
-        adir = self._plan.archive_dir()
+        # all shards of the logical backup; each holds a disjoint subset. In
+        # source mode _adir() is the browsed directory the user pointed at.
+        adir = self._adir()
         archive_paths = [adir / m.filename for m in self._current_set.members]
         dlg = RestoreDialog(archive_paths, paths, parent=self,
                             label=_set_label(self._current_set))
