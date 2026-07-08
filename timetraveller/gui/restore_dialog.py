@@ -85,7 +85,8 @@ class RestoreDialog(QDialog):
     """Extract specific paths from a backup (one or more shard archives) into a
     chosen destination."""
 
-    def __init__(self, archives, paths: list[str], parent=None, *, label: str = ""):
+    def __init__(self, archives, paths: list[str], parent=None, *, label: str = "",
+                 original_sources: list[str] | None = None):
         super().__init__(parent)
         self.setWindowTitle("Extract from backup")
         self.resize(900, 600)
@@ -93,6 +94,10 @@ class RestoreDialog(QDialog):
         # Accept a single Path (legacy) or a list of shard archive paths.
         self._archives = [archives] if isinstance(archives, Path) else list(archives)
         self._paths = paths
+        # Original filesystem root(s) the files came from (from the plan/descriptor).
+        # Archive members are stored root-rooted (./home/kim/…), so restoring to
+        # the original location means extracting into "/".
+        self._original_sources = original_sources or []
         self._thread: QThread | None = None
         self._worker: _ExtractWorker | None = None
 
@@ -120,7 +125,19 @@ class RestoreDialog(QDialog):
         browse = QPushButton("Browse…")
         browse.clicked.connect(self._on_browse)
         dest_row.addWidget(browse)
+        if self._original_sources:
+            original = QPushButton("Original location…")
+            original.setToolTip(
+                "Restore files back to where they came from ("
+                + ", ".join(self._original_sources) + ") — overwrites live files.")
+            original.clicked.connect(self._on_use_original)
+            dest_row.addWidget(original)
         layout.addLayout(dest_row)
+        if self._original_sources:
+            hint = QLabel("These files were originally under: <b>"
+                          + ", ".join(self._original_sources) + "</b>")
+            hint.setStyleSheet("color: #57606a; padding: 0 4px;")
+            layout.addWidget(hint)
 
         # Description of what the extract will do (no shell command anymore —
         # this is a direct Python call into the seekable-archive engine).
@@ -158,6 +175,23 @@ class RestoreDialog(QDialog):
         d = QFileDialog.getExistingDirectory(self, "Choose extraction destination", start)
         if d:
             self._dest.setText(d)
+
+    def _on_use_original(self) -> None:
+        """Set the destination to the filesystem root so members restore to their
+        original absolute paths — with a clear overwrite warning first."""
+        from PyQt6.QtWidgets import QMessageBox
+        r = QMessageBox.warning(
+            self, "Restore to original location?",
+            "This restores the selected files to their <b>original locations</b> under "
+            + ", ".join(self._original_sources)
+            + ", <b>overwriting</b> any existing files there.<br><br>"
+            "System paths may require running TimeTraveller as root. To stage the "
+            "files somewhere safe instead, use <b>Browse…</b>.<br><br>Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if r == QMessageBox.StandardButton.Yes:
+            self._dest.setText("/")
 
     def _on_extract(self) -> None:
         dest = Path(self._dest.text()).expanduser()

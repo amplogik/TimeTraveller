@@ -804,7 +804,8 @@ class ArchivePanel(QWidget):
         adir = self._adir()
         archive_paths = [adir / m.filename for m in self._current_set.members]
         dlg = RestoreDialog(archive_paths, paths, parent=self,
-                            label=_set_label(self._current_set))
+                            label=_set_label(self._current_set),
+                            original_sources=list(self._plan.sources) if self._plan else None)
         dlg.exec()
         # Selection might have been invalidated by user interaction; refresh.
         self._update_selection_label()

@@ -339,17 +339,30 @@ def _save_manifest(m: manifestlib.Manifest, archive_dir: Path, plan_name: str) -
 
 
 def _write_restore_descriptor(archive_dir: Path, plan: configlib.PlanConfig) -> None:
-    """Best-effort: write the self-describing restore descriptor next to the
-    manifest so a config-less restore (fresh install / USB drive) can recover
-    the plan's identity and original source roots. A failure here must never
-    fail the backup — the descriptor is derived data (--refresh-from-mount
-    backfills it), and the manifest alone still supports extract-to-a-dir."""
+    """Best-effort: write the two config-less restore aids next to the manifest —
+    the self-describing `timetraveller.restore.json` descriptor (plan identity +
+    original source roots) and the standalone `timetraveller-restore.sh` bootstrap
+    script (recover on a machine with no TimeTraveller installed). Failures here
+    must never fail the backup — both are derived data, regenerated on the next
+    backup or --refresh-from-mount, and the manifest alone still supports
+    extract-to-a-dir."""
     from . import __version__
+    from . import restore_bootstrap as bootstraplib
     try:
         desc = restoresrc.from_plan(plan, created_by=f"timetraveller {__version__}")
         restoresrc.write_descriptor(archive_dir, desc)
     except OSError as e:
         print(f"WARNING: restore descriptor write failed: {e}", file=sys.stderr)
+    try:
+        bootstraplib.write_bootstrap_script(archive_dir)
+        # Also at the backup root, so a top-level run discovers every plan and
+        # offers a pick (the per-plan copy anchors to its own dir and sees only
+        # that plan). Best-effort; the mount is already writable in this path.
+        root = Path(plan.destination)
+        if root != archive_dir:
+            bootstraplib.write_bootstrap_script(root)
+    except OSError as e:
+        print(f"WARNING: bootstrap restore script write failed: {e}", file=sys.stderr)
 
 
 def _mirror_sidecar(plan_name: str, source_sidecar: Path,
