@@ -1,3 +1,30 @@
+timetraveller (1.5.0) unstable; urgency=medium
+
+  * Integrity: verify-after-write (D1). With verify_after_write (default on),
+    each shard re-reads itself from the backup store immediately after writing
+    -- cache-dropped, so it checks what actually landed, not the client buffer --
+    inside its own writer thread so the read overlaps sibling-shard writes (near
+    free in wall-clock). A frame that fails its checksum marks the shard
+    "corrupt", records the affected files, keeps the archive browsable, skips
+    retention (preserving the redundancy heal needs), and exits with a --heal
+    hint. Catches post-write corruption (e.g. non-ECC bit flips) the same night
+    instead of years later at restore.
+  * Recovery: heal-from-redundancy (D2). New --heal <backup> finds files damaged
+    by frame corruption and restores a clean copy of each from another cycle
+    that still holds one; unrecoverable files are reported. GUI gains a corrupt
+    badge + "Recover damaged files (heal)..." action.
+  * Portable restore: a small timetraveller.restore.json descriptor (plan
+    identity + original source roots) is written beside each manifest and
+    backfilled on --refresh-from-mount, plus a self-contained
+    timetraveller-restore.sh bootstrap script that recovers on a machine with no
+    TimeTraveller installed (needs only bash, python3, tar, zstd).
+  * GUI: new "Restore from location..." -- browse to a backup on a USB drive,
+    external disk, or network share and restore from it directly, with no
+    matching plan config. The extract dialog can restore to the original
+    location (behind an overwrite warning) or a staging directory.
+
+ -- Kim McCann <amplogik@gmail.com>  Wed, 08 Jul 2026 10:09:30 -0700
+
 timetraveller (1.4.4) unstable; urgency=medium
 
   * Fix: after a privileged (pkexec) backup/delete/reindex/recover on a
