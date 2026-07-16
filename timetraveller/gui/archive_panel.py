@@ -163,6 +163,7 @@ class ArchivePanel(QWidget):
         self._search_widget = SearchWidget()
         self._search_widget.back_requested.connect(self._exit_search_mode)
         self._search_widget.result_activated.connect(self._on_search_result_activated)
+        self._search_widget.extract_requested.connect(self._on_search_extract)
         self._right_stack.addWidget(self._search_widget)
 
         splitter.addWidget(self._right_stack)
@@ -703,6 +704,48 @@ class ArchivePanel(QWidget):
             self._pending_highlight_path = None
             return
         self._select_set(group)
+
+    def _set_for_group(self, group_id: str) -> manifestlib.ShardSet | None:
+        """Resolve a logical backup's shard set (all shards) from the current
+        listing by its group id. Used to turn a search hit — which names a
+        single shard file — into the full shard set to extract from."""
+        for c in self._load_listing().cycles:
+            for s in manifestlib.group_into_sets(c.archives):
+                if s.group_id == group_id:
+                    return s
+        return None
+
+    def _on_search_extract(self, pairs: list) -> None:
+        """Extract files chosen in the search results.
+
+        `pairs` is a list of (archive_filename, archive_path). Each archive
+        filename names one shard; group the requested paths by their logical
+        backup and open one RestoreDialog per backup, extracting from all of
+        that backup's shards — exactly the browse-tree extract path, so the
+        file that comes out is the one selected in search.
+        """
+        if self._plan is None or not pairs:
+            return
+        adir = self._adir()
+        if adir is None:
+            return
+        by_group: dict[str, list[str]] = {}
+        for archive, path in pairs:
+            by_group.setdefault(self._group_of(archive), []).append(path)
+        sources = list(self._plan.sources) if self._plan else None
+        for group_id, paths in by_group.items():
+            s = self._set_for_group(group_id)
+            if s is None:
+                QMessageBox.warning(
+                    self, "Backup not found",
+                    f"Could not locate backup {group_id} to extract from.")
+                continue
+            seen: set[str] = set()
+            uniq = [p for p in paths if not (p in seen or seen.add(p))]
+            archive_paths = [adir / m.filename for m in s.members]
+            dlg = RestoreDialog(archive_paths, uniq, parent=self,
+                                label=_set_label(s), original_sources=sources)
+            dlg.exec()
 
     def _scroll_to_path(self, path: str) -> None:
         """Locate `path` (e.g. './home/kim/recipe.md') in the loaded tree

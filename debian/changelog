@@ -1,3 +1,17 @@
+timetraveller (1.5.1) unstable; urgency=medium
+
+  * GUI fix: extract from search results. The Archives search panel had no
+    extract action of its own -- the bottom "Extract selected..." button always
+    operated on the (possibly hidden) browse tree, so picking a file in search
+    and clicking Extract silently extracted whatever was selected in the file
+    tree instead (e.g. asking for ./etc/hosts and getting ./etc/brltty). The
+    search panel now has its own "Extract selected..." button that extracts the
+    file(s) selected there, resolved to the owning shard set and routed through
+    the same RestoreDialog as the browse tree. Selecting a version row extracts
+    that exact copy; selecting a path row extracts its newest version.
+
+ -- Kim McCann <amplogik@gmail.com>  Thu, 16 Jul 2026 15:49:56 -0700
+
 timetraveller (1.5.0) unstable; urgency=medium
 
   * Integrity: verify-after-write (D1). With verify_after_write (default on),

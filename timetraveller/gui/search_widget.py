@@ -20,8 +20,8 @@ from pathlib import Path
 
 from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
-    QComboBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QPushButton,
-    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QComboBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QPushButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .. import search as searchlib
@@ -91,6 +91,12 @@ class SearchWidget(QWidget):
     # Fired when the user dismisses search (close button or Esc). ArchivePanel
     # listens to switch the right-pane stack back to the file-tree view.
     back_requested = pyqtSignal()
+    # A list of (archive_filename, archive_path) pairs the user asked to extract
+    # straight from the search results. ArchivePanel resolves each to its logical
+    # backup's shards and opens the RestoreDialog — same path as the browse-tree
+    # "Extract selected…" button, so the file that comes out is the one that was
+    # picked here (not whatever happened to be selected in the hidden file tree).
+    extract_requested = pyqtSignal(list)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -130,13 +136,32 @@ class SearchWidget(QWidget):
                                        "Modified (at backup)"])
         self._results.setRootIsDecorated(True)
         self._results.setUniformRowHeights(True)
+        self._results.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
         self._results.itemActivated.connect(self._on_item_activated)
+        self._results.itemSelectionChanged.connect(self._update_extract_state)
         self._results.setColumnWidth(0, 420)
         layout.addWidget(self._results, 1)
 
         self._status = QLabel("")
         self._status.setStyleSheet("color: #6e7781; padding: 2px 4px;")
         layout.addWidget(self._status)
+
+        # Extract straight from the results, so the file that comes out is the
+        # one selected here. Mirrors the browse tab's bottom "Extract selected…".
+        extract_row = QHBoxLayout()
+        self._sel_label = QLabel("")
+        self._sel_label.setStyleSheet("color: #6e7781; padding: 2px 4px;")
+        extract_row.addWidget(self._sel_label)
+        extract_row.addStretch(1)
+        self._extract_btn = QPushButton("Extract selected…")
+        self._extract_btn.setEnabled(False)
+        self._extract_btn.setToolTip(
+            "Extract the file(s) selected here from the archive that holds them"
+        )
+        self._extract_btn.clicked.connect(self._on_extract_clicked)
+        extract_row.addWidget(self._extract_btn)
+        layout.addLayout(extract_row)
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -173,6 +198,7 @@ class SearchWidget(QWidget):
         self._input.clear()
         self._results.clear()
         self._status.setText("")
+        self._update_extract_state()
 
     def focus_input(self) -> None:
         self._input.setFocus()
@@ -288,6 +314,8 @@ class SearchWidget(QWidget):
         # Refit columns to content for the first 3, leave last col fluid.
         for col in (1, 2):
             self._results.resizeColumnToContents(col)
+        # Fresh result set starts with nothing selected.
+        self._update_extract_state()
 
     def _on_item_activated(self, item: QTreeWidgetItem, _col: int) -> None:
         data = item.data(0, Qt.ItemDataRole.UserRole)
@@ -297,6 +325,50 @@ class SearchWidget(QWidget):
             return
         _, archive, path = data
         self.result_activated.emit(archive, path)
+
+    # ---------- extract-from-search ----------
+
+    def _selected_extract_pairs(self) -> list[tuple[str, str]]:
+        """The (archive, path) pairs to extract for the current selection.
+
+        A selected *version* row extracts that exact copy. A selected *path*
+        row (the parent, with N versions) resolves to its newest version — the
+        first child, since `_populate` sorts versions mtime-descending. Pairs
+        are de-duplicated, preserving selection order.
+        """
+        pairs: list[tuple[str, str]] = []
+        for item in self._results.selectedItems():
+            data = item.data(0, Qt.ItemDataRole.UserRole)
+            if not isinstance(data, tuple):
+                continue
+            if data[0] == "version":
+                pairs.append((data[1], data[2]))
+            elif data[0] == "path" and item.childCount() > 0:
+                child = item.child(0).data(0, Qt.ItemDataRole.UserRole)
+                if isinstance(child, tuple) and child[0] == "version":
+                    pairs.append((child[1], child[2]))
+        seen: set[tuple[str, str]] = set()
+        out: list[tuple[str, str]] = []
+        for pr in pairs:
+            if pr not in seen:
+                seen.add(pr)
+                out.append(pr)
+        return out
+
+    def _update_extract_state(self) -> None:
+        pairs = self._selected_extract_pairs()
+        self._extract_btn.setEnabled(bool(pairs))
+        if pairs:
+            self._sel_label.setText(
+                f"{len(pairs)} file{'s' if len(pairs) != 1 else ''} selected"
+            )
+        else:
+            self._sel_label.setText("")
+
+    def _on_extract_clicked(self) -> None:
+        pairs = self._selected_extract_pairs()
+        if pairs:
+            self.extract_requested.emit(pairs)
 
 
 def _human_size(n: int) -> str:
