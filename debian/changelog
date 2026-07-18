@@ -1,3 +1,22 @@
+timetraveller (1.5.3) unstable; urgency=medium
+
+  * Documentation: bring the in-app Help and the README up to date with the
+    Archives search and restore-from-anywhere features, which had never been
+    documented.
+    - Both now describe cross-archive search (the "Search files..." panel):
+      filename vs. full-path matching, per-path version lists, jump-to-tree,
+      and extracting the selected copy straight from the results. Both note
+      that extract acts on whichever pane is in view (the v1.5.1/1.5.2
+      behaviour).
+    - Both now describe "Restore from location..." -- browsing, searching, and
+      extracting from a USB drive or NAS share with no local plan configured.
+    - README status line bumped to v1.5.3 (was a stale v1.4.3) and two feature
+      highlights added.
+  * No code/behaviour changes; the help text is compiled into the GUI, so this
+    ships as a release rather than a docs-only push.
+
+ -- Kim McCann <amplogik@gmail.com>  Sat, 18 Jul 2026 11:53:49 -0700
+
 timetraveller (1.5.2) unstable; urgency=medium
 
   * Archives cleanup pass -- three fixes to the archive browser/search:

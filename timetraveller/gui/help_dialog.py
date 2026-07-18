@@ -102,6 +102,32 @@ even for huge archives.</li>
 <li>Drill into directories as you would in a file manager.</li>
 </ol>
 
+<h2>How to search across archives</h2>
+<p>When you can't spot a file in the tree &mdash; or you're not sure which
+cycle still has it &mdash; search instead of scrolling.</p>
+<ol>
+<li>On the <b>Archives</b> tab, click <b>&#128269; Search files&hellip;</b>
+above the file tree.</li>
+<li>Type part of a name. <b>Filename</b> mode matches the last path component;
+<b>Full path</b> mode matches anywhere in the path. Search runs across
+<i>every</i> archive in the plan at once, so you find a file without knowing
+which cycle or shard holds it.</li>
+<li>Results group by path. Expand a path to see every backup that holds a
+copy, with its size and modified-at-backup time, so you can pick the version
+with the content you want.</li>
+<li>Double-click a result to jump straight to that file in the browse
+tree.</li>
+<li>Or restore without leaving search: select one or more results and click
+the <b>Extract selected&hellip;</b> button on the search panel. A <i>version</i>
+row extracts that exact copy; a <i>path</i> row extracts its newest
+version.</li>
+</ol>
+<p><b>Extract always acts on the pane you're looking at.</b> The search
+panel's own Extract button operates on your search selection; the bottom
+Extract button (hidden while search is open) operates on the file-tree
+selection. You always get the file you highlighted, never a stale pick from
+the other view.</p>
+
 <h2>How to restore from an archive</h2>
 <ol>
 <li>Browse to the archive you want to restore from (see <i>How to
@@ -130,6 +156,15 @@ fallback when it isn't.</li>
 <p>To restore an <i>entire</i> cycle, the command line is more
 comfortable:</p>
 <pre><code>timetraveller-backup --plan &lt;name&gt; --extract &lt;archive&gt;.pax.zst --into /restore/path .</code></pre>
+
+<h2>Restoring from a drive with no plan configured</h2>
+<p>You don't need the original machine or its config to get your files back.
+On any box with TimeTraveller installed, click <b>Restore from
+location&hellip;</b> in the toolbar and browse to where the backup lives
+&mdash; a USB drive, an external disk, or a mounted NAS share. TimeTraveller
+reads that location directly: the <b>Archives</b> tab fills with its cycles,
+and browsing, searching, and <b>Extract selected&hellip;</b> all work exactly
+as they do for a locally-configured plan.</p>
 """
 
 

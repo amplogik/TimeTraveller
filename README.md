@@ -2,11 +2,13 @@
 
 A local Linux backup tool focused on **trustworthy backups** and **fast, partial recovery**.
 
-Status: **v1.4.3** — stable.
+Status: **v1.5.3** — stable.
 
 **Highlights since v1.0:**
 
 - **Verifiable integrity** — every archive frame carries a SHA-256 computed inline as it's written (no extra read pass), so corruption introduced anywhere from compression onward (client buffer, NFS, network, storage) is detectable. `--verify` re-checks an archive against those digests *without decompressing it*.
+- **Cross-archive search & partial restore** — search a filename (or full path) across every cycle and shard of a plan at once, compare the versions that turn up, and extract just the copy you want — straight from the results.
+- **Restore from anywhere** — point the GUI at a backup on a USB drive or NAS share with no local config and browse, search, and extract from it exactly as a local plan.
 - **Parallel multi-shard backups** — a backup can be split into N independent shards written concurrently, for substantially higher throughput on multi-core machines. Restores transparently span the shard set.
 - **Full GUI management of system-level backups** — running, deleting, reindexing and recovering `system`/`homes` plans (whose archives are root-owned) all escalate through a single Polkit prompt; no dropping to a root shell.
 - **Tri-state backup status** — `ok` / `ok-with-warnings` / `failed`. Benign races (a browser rewriting its cache mid-backup, a temp file vanishing) are warnings, not failures, so a backup is only flagged failed when the archive is actually untrustworthy.
@@ -174,6 +176,17 @@ Flip a plan between types via the **Change…** button on the Plan tab. The dial
 3. Click an archive to load its contents into the file tree on the right — sourced from the archive's seekable sidecar, so it's fast even for huge archives.
 4. Drill into directories as you would in a file manager.
 
+### How to search across archives
+
+When you can't spot a file in the tree — or you're not sure which cycle still has it — search instead of scrolling.
+
+1. On the **Archives** tab, click **🔍 Search files…** above the file tree.
+2. Type part of a name. **Filename** mode matches the last path component; **Full path** mode matches anywhere in the path. Search runs across *every* archive in the plan at once, so you find a file without knowing which cycle or shard holds it.
+3. Results group by path — expand one to see every backup that holds a copy, with its size and modified-at-backup time, so you can pick the version with the content you want.
+4. Double-click a result to jump straight to that file in the browse tree, **or** select one or more results and click the search panel's own **Extract selected…** to restore without leaving search. A *version* row extracts that exact copy; a *path* row extracts its newest version.
+
+Extract always acts on the pane you're looking at: the search panel's Extract button uses your search selection (and the bottom Extract button is hidden while search is open), so you always get the file you highlighted — never a stale pick from the other view. In **Restore from location…** (source) mode, search reads the same browsed location the tree does, so the two never disagree.
+
 ### How to restore from an archive
 
 1. Browse to the archive (see above).
@@ -190,6 +203,10 @@ To restore an *entire* cycle, the command line is more comfortable:
 ```bash
 timetraveller-backup --plan <name> --extract <archive>.pax.zst --into /restore/path .
 ```
+
+### Restoring from a drive with no plan configured
+
+You don't need the original machine or its config to get your files back. On any box with TimeTraveller installed, click **Restore from location…** in the toolbar and browse to where the backup lives — a USB drive, an external disk, or a mounted NAS share. TimeTraveller reads that location directly: the **Archives** tab fills with its cycles, and browsing, searching, and **Extract selected…** all work exactly as they do for a locally-configured plan.
 
 ### How to manage archives (verify, delete, export, recover)
 
