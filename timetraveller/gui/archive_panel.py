@@ -174,8 +174,12 @@ class ArchivePanel(QWidget):
         # tree model is populated.
         self._pending_highlight_path: str | None = None
 
-        # Bottom toolbar.
-        bottom = QHBoxLayout()
+        # Bottom toolbar — acts on the BROWSE tree's selection. Wrapped in a
+        # container so it can be hidden while the search page is showing (the
+        # search page carries its own Extract button for what's visible there).
+        self._browse_extract_bar = QWidget()
+        bottom = QHBoxLayout(self._browse_extract_bar)
+        bottom.setContentsMargins(0, 0, 0, 0)
         self._selection_label = QLabel("Selected: 0 paths")
         bottom.addWidget(self._selection_label)
         bottom.addStretch(1)
@@ -183,7 +187,7 @@ class ArchivePanel(QWidget):
         self._extract_btn.setEnabled(False)
         self._extract_btn.clicked.connect(self._on_extract)
         bottom.addWidget(self._extract_btn)
-        layout.addLayout(bottom)
+        layout.addWidget(self._browse_extract_bar)
 
     # ---------- plan switching ----------
 
@@ -263,7 +267,8 @@ class ArchivePanel(QWidget):
         all_entries: list[ArchiveEntry] = []
         for c in listing.cycles:
             all_entries.extend(c.archives)   # every shard, so all are searchable
-        self._search_widget.set_plan(self._pname(), all_entries)
+        self._search_widget.set_plan(self._pname(), all_entries,
+                                     sidecar_for=self._shard_sidecar_path)
         if not listing.cycles:
             msg = ("(no backups found in this location)" if self._in_source_mode()
                    else "(no archives in local mirror — run "
@@ -321,6 +326,11 @@ class ArchivePanel(QWidget):
             self._pending_group = None
             return
         if self._current_set and s.group_id == self._current_set.group_id:
+            # Already showing this backup — no reload. But reselecting it is
+            # also the user's instinctive "un-stick the tree" gesture, so if the
+            # view came back blank (rows never laid out while hidden), relayout.
+            if self._tree_model is not None:
+                self._file_tree.doItemsLayout()
             return
         if not self._plan:
             return
@@ -687,10 +697,22 @@ class ArchivePanel(QWidget):
 
     def _enter_search_mode(self) -> None:
         self._right_stack.setCurrentIndex(1)
+        # The bottom "Extract selected…" acts on the browse tree, now hidden
+        # behind the search page. The search page has its own Extract button
+        # for what's visible there, so hide this one — the only exposed extract
+        # should match what the user actually sees highlighted.
+        self._browse_extract_bar.setVisible(False)
         self._search_widget.focus_input()
 
     def _exit_search_mode(self) -> None:
         self._right_stack.setCurrentIndex(0)
+        self._browse_extract_bar.setVisible(True)
+        # A sidecar load that completed WHILE the search page was showing set
+        # the model on a then-hidden QTreeView; with uniform row heights the
+        # view can return blank because its rows were never laid out. Now that
+        # the browse page is visible again, force the layout so it repaints.
+        if self._tree_model is not None:
+            self._file_tree.doItemsLayout()
 
     def _on_search_result_activated(self, archive: str, path: str) -> None:
         # A search hit names one shard file; navigate to its logical backup
@@ -801,6 +823,12 @@ class ArchivePanel(QWidget):
         if root is None:
             self._file_tree.setModel(None)
             self._tree_model = None
+            # Forget the shown backup too. Otherwise a later reselect of the
+            # SAME set hits the same-set early-return guard in
+            # _on_archive_selection and never reloads — leaving the tree blank
+            # for good (the refresh()/tab-switch-to-Archives path blanks the
+            # tree without changing the left-list selection).
+            self._current_set = None
             self._selection_label.setText("Selected: 0 paths")
             self._extract_btn.setEnabled(False)
             return

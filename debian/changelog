@@ -1,3 +1,25 @@
+timetraveller (1.5.2) unstable; urgency=medium
+
+  * Archives cleanup pass -- three fixes to the archive browser/search:
+    - Source-mode search/browse divergence: the cross-archive search read the
+      local sidecar mirror while the browse tree read the browsed directory in
+      restore-from-anywhere (source) mode, so their results could disagree.
+      Search now reads the same sidecar source the browse tree uses per mode,
+      and stats the sidecar file rather than trusting the manifest's
+      (possibly stale) has_sidecar flag.
+    - Extract button vs. visible selection: the bottom "Extract selected..."
+      button acts on the browse tree, but stayed visible while the search page
+      (which has its own extract button) was shown. It is now hidden while
+      searching, so the only exposed extract always matches what is on screen.
+    - Blank file tree after search: opening an archive and switching to search
+      before its sidecar finished loading set the tree model on a hidden
+      QStackedWidget page, leaving the uniform-height rows un-laid-out, so the
+      browse pane came back blank and would not repopulate. The view is now
+      relaid out when the browse page becomes visible again, and blanking the
+      tree clears the current-set guard so a reselect always reloads.
+
+ -- Kim McCann <amplogik@gmail.com>  Sat, 18 Jul 2026 11:14:23 -0700
+
 timetraveller (1.5.1) unstable; urgency=medium
 
   * GUI fix: extract from search results. The Archives search panel had no

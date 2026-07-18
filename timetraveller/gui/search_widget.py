@@ -170,21 +170,29 @@ class SearchWidget(QWidget):
 
     # ---------- public API ----------
 
-    def set_plan(self, plan_name: str, entries: list[ArchiveEntry]) -> None:
+    def set_plan(self, plan_name: str, entries: list[ArchiveEntry],
+                 sidecar_for=None) -> None:
         """Hand the widget the plan's manifest entries.
 
-        Builds the scannable list (entries with has_sidecar=True AND a
-        mirrored sidecar file actually on disk). If a search is already
+        `sidecar_for` is a callable filename -> Path that resolves a shard's
+        .idx.zst for the CURRENT browse mode: the local mirror in plan mode,
+        the browsed directory in source mode (restore-from-anywhere). It must
+        be the same resolver the browse tree uses, so search and browse read
+        the identical sidecar set and can't disagree. When omitted (e.g. no
+        plan loaded), we fall back to the mirror.
+
+        An entry is scannable when its resolved sidecar actually exists on
+        disk — we stat rather than trust the manifest's `has_sidecar` flag,
+        which can be stale for a browsed location. If a search is already
         active, re-runs it against the new sidecar set.
         """
         self._plan_name = plan_name
+        resolve = sidecar_for or (lambda fn: sidecar_mirror_path(plan_name, fn))
         scannable: list[tuple[ArchiveEntry, Path]] = []
         by_name: dict[str, ArchiveEntry] = {}
         for e in entries:
             by_name[e.filename] = e
-            if not e.has_sidecar:
-                continue
-            sc = sidecar_mirror_path(plan_name, e.filename)
+            sc = resolve(e.filename)
             if sc.exists():
                 scannable.append((e, sc))
         self._scannable = scannable
