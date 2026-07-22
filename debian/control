@@ -24,8 +24,11 @@ Depends:
  python3-pyqt6,
  pax,
  zstd,
- polkitd | policykit-1
-Recommends: cron
+ polkitd | policykit-1,
+ pkexec | policykit-1
+Recommends:
+ cron,
+ policykit-1-gnome | mate-polkit | polkit-kde-agent-1 | lxpolkit | xfce-polkit
 Description: Local Linux backup tool with seekable pax+zstd archives
  TimeTraveller is a local backup tool focused on trustworthy backups and
  fast, partial recovery.
