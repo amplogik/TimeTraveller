@@ -1,3 +1,27 @@
+timetraveller (1.5.4) unstable; urgency=medium
+
+  * debian/control: declare pkexec explicitly. Depends listed
+    "polkitd | policykit-1", but since Debian 12 / Ubuntu 23.04 the old
+    policykit-1 package was split and polkitd ships only the daemon --
+    /usr/bin/pkexec is now its own binary package. A minimal install could
+    satisfy every declared dependency and still have no pkexec, breaking
+    every privileged helper path (system backup, delete, maintain, crontab
+    install, config write). The alternation "pkexec | policykit-1" also
+    covers older releases where policykit-1 still shipped the binary.
+  * debian/control: recommend a graphical polkit authentication agent. It is
+    Recommends rather than Depends because GNOME's agent lives inside
+    gnome-shell and Provides: nothing, so no alternation can express "this
+    desktop already has one"; pkexec falls back to its own textual agent for
+    CLI use regardless.
+  * Fix stale __version__ leaking a wrong version into archive provenance.
+    timetraveller/__init__.py still said 1.5.0 while the changelog and
+    pyproject.toml said 1.5.3. Not cosmetic: worker.py stamps archives with
+    created_by=f"timetraveller {__version__}", so every archive written by
+    v1.5.1 through v1.5.3 falsely claims it was created by 1.5.0. The version
+    lives in three places, not the two the release process assumed.
+
+ -- Kim McCann <amplogik@gmail.com>  Wed, 22 Jul 2026 13:45:38 -0700
+
 timetraveller (1.5.3) unstable; urgency=medium
 
   * Documentation: bring the in-app Help and the README up to date with the
