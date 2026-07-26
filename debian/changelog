@@ -1,3 +1,89 @@
+timetraveller (1.6.0) unstable; urgency=medium
+
+  * Restore to original locations now escalates instead of silently failing.
+    Restoring a system-class plan's files back to where they came from needs
+    root, but that path had no pkexec support at all: the GUI's "Original
+    location..." button pointed an unprivileged extract at "/", so anything
+    outside the user's own home failed with permission errors partway through,
+    leaving a half-finished restore on disk. Found in the field recovering
+    VST/CLAP plugins from /usr/lib/vst, where the workaround was to extract to
+    $HOME and copy into place with sudo -- fine for a sysadmin, not
+    discoverable for the audience the GUI exists for.
+    - New privileged helper /usr/libexec/timetraveller-restore-system-files
+      with a matching com.timetraveller.restore-system-files polkit action,
+      same allow_active=auth_admin_keep posture as the other four.
+    - The helper's destination is HARDCODED to "/" and is not a parameter.
+      That is deliberate and load-bearing: accepting a caller-supplied --into
+      would turn it into a write-anywhere-as-root primitive, and any other
+      destination is somewhere the invoking user could have written to
+      themselves. It also refuses to take an archive path, deriving the
+      archive directory from the root-owned /etc/timetraveller/<plan>.yaml the
+      way the delete helper does. Every member path must be './'-rooted (which
+      doubles as argv-injection defence), must contain no '..' component, no
+      NUL and no control characters, and both the member count and length are
+      capped.
+  * Privileges are pre-flighted before any bytes are written, in both the GUI
+    and the CLI, so a restore either starts or explains itself -- it no longer
+    dies mid-extract leaving a partial restore behind. Routing is decided by
+    the *destination* rather than the plan class, so extracting a system-plan
+    member into ~/Restored stays unprivileged and prompt-free.
+    - A root-owned destination that is NOT "/" is refused rather than
+      escalated. Since the helper forces "/", routing e.g. --into /opt/foo
+      through it would have scattered the files to their original locations
+      instead of the directory that was asked for.
+    - Source mode ("Restore from location...") gets no automatic escalation,
+      because the helper takes its archive directory from the root-owned plan
+      config and never from a caller-supplied path, so it cannot be pointed at
+      a browsed drive. Documented rather than silently absent.
+  * Fix: the naive (no-sidecar) extract path reported success on total
+    failure. It discarded tar's stderr, ignored its exit status entirely (the
+    check was literally `pass`), and then tallied results by walking the
+    destination directory -- so a wholly failed extract into a non-empty
+    directory returned a large bytes_written and read as a clean restore. It
+    now honours tar's exit status, distinguishes a genuinely benign "Not found
+    in archive" (expected: callers extract the same pattern list from every
+    shard of a sharded backup) from a real failure, and counts only the
+    members tar reports having written. BEHAVIOUR CHANGE: extract.extract_files
+    can now raise extract.ExtractError where it previously returned stats
+    describing a failure as a success.
+  * Fix: "nobody verified this backup" no longer looks identical to "this
+    backup was verified". _verify_shard_after_write() returned a bare [] for
+    four different outcomes -- verified-clean, the check threw, there was no
+    checksum-bearing sidecar to check against, and verification was switched
+    off -- so corrupt_frames=0 was unfalsifiable. The only distinguishing
+    signal was a stderr WARNING that never reached _log() at all, and cron
+    entries do not redirect stdout either, so on a scheduled or pkexec run it
+    left no trace anywhere. That ambiguity is what made a real corruption
+    question unanswerable from records.
+    - New ArchiveEntry.verify_state: verified | unverified | error | disabled,
+      or "" for legacy entries and shards where verify was never attempted.
+      Additive and optional, so old manifests load unchanged.
+    - ShardSet.verify_state aggregates worst-first, plus is_fully_verified.
+      Deliberately does NOT feed status or is_complete: an unverified shard is
+      a gap in knowledge, not damage, and treating it as corruption would mark
+      healthy cycles incomplete and change what retention prunes.
+    - The Archives list shows "ok (unverified)" in muted grey with a tooltip
+      explaining which of the four cases applied and how to re-check. Legacy
+      entries stay unmarked -- greying out all history would be noise, and the
+      distinction self-heals from the next backup onward.
+    - A backup with unverified shards now says so on stderr and in its log,
+      and reports the cycle as written-but-UNVERIFIED. Exit status stays 0:
+      nothing is known to be wrong.
+    - New _append_to_log() writes verify and corruption diagnostics to the
+      shard's log FILE rather than only to streams nothing captures. This is
+      the other half of the /var/log/timetraveller ownership fix below.
+  * Packaging: the package now owns /var/log/timetraveller (debian/dirs).
+    It previously existed only because worker.py's _default_log_path() mkdir'd
+    it at runtime, so an OS reinstall took the backup logs with it -- which is
+    exactly what happened on a rebuild, destroying the only post-hoc evidence
+    for a corruption investigation.
+  * Documentation: the in-app Help and the README both describe restoring to
+    original locations -- when a password is required, when it is refused and
+    why, and that restored files keep the ownership and permissions recorded
+    in the archive. README status line bumped to v1.6.0 (was a stale v1.5.3).
+
+ -- Kim McCann <amplogik@gmail.com>  Sun, 26 Jul 2026 08:11:17 -0700
+
 timetraveller (1.5.4) unstable; urgency=medium
 
   * debian/control: declare pkexec explicitly. Depends listed

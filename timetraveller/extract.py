@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -206,6 +208,37 @@ def _slice_file_body(rec: dict, frames_meta: list[dict],
 
 # ---------- filesystem writeout ----------
 
+def dest_needs_root(dest: Path) -> bool:
+    """True if writing into `dest` requires privileges this process lacks.
+
+    Restore differs from backup/delete: whether root is needed depends on the
+    *destination*, not only on the plan class. Extracting a system-plan member
+    into ~/Restored is an ordinary unprivileged write and must stay prompt-free;
+    only writing back to a root-owned location needs an escalation path.
+
+    `dest` usually does not exist yet, so we test the nearest existing ancestor —
+    that is the directory whose permissions actually decide whether the mkdir +
+    write chain can start. Both W_OK and X_OK are required: a directory can be
+    writable but not searchable.
+
+    Running as root short-circuits to False (os.access would answer True for
+    almost everything anyway, and a root caller needs no helper).
+
+    Lives here rather than in worker.py so the GUI can pre-flight with it without
+    importing the worker, which it otherwise only ever runs as a subprocess.
+    """
+    if os.geteuid() == 0:
+        return False
+    probe = dest if dest.is_absolute() else Path.cwd() / dest
+    while True:
+        if probe.exists():
+            return not os.access(probe, os.W_OK | os.X_OK)
+        parent = probe.parent
+        if parent == probe:      # walked up to the root and found nothing
+            return True
+        probe = parent
+
+
 def _safe_out_path(record_name: str, into: Path) -> Path:
     """Map an archive path like `./etc/fstab` to <into>/etc/fstab, refusing
     any attempt to escape the destination directory (e.g. `../`)."""
@@ -352,46 +385,114 @@ def extract_files(
     )
 
 
+# A requested member simply not being in this shard is expected and benign: a
+# logical backup is sharded, and callers extract the same pattern list from every
+# shard (each member lives in exactly one). GNU tar reports that as exit 2 with
+# these two lines and nothing else. Anything else in stderr — permission denied,
+# no space, a malformed archive — is a real failure and must not be swallowed.
+_BENIGN_TAR_STDERR_RE = re.compile(
+    r"(?::\s*Not found in archive\s*$)"
+    r"|(?:^tar:\s*Exiting with failure status due to previous errors\s*$)"
+)
+
+
+def _tar_stderr_is_only_benign(text: str) -> bool:
+    """True if every non-blank stderr line is a benign not-found diagnostic."""
+    lines = [ln for ln in (text or "").splitlines() if ln.strip()]
+    return bool(lines) and all(_BENIGN_TAR_STDERR_RE.search(ln) for ln in lines)
+
+
+class ExtractError(RuntimeError):
+    """A naive-path extraction failed for a reason that is not 'no such member'.
+
+    Raised rather than reported so a failure can never be mistaken for success —
+    a restore that silently dropped every root-owned file is far worse than one
+    that stops with an error.
+    """
+
+
 def _extract_naive(archive_path: Path, patterns: list[str], *,
                    into: Path, started: float) -> ExtractStats:
     """Fallback: pipe the whole archive through tar -x and let tar pick
-    out the requested members. Works on any archive regardless of sidecars."""
+    out the requested members. Works on any archive regardless of sidecars.
+
+    Counts only the members tar reports having extracted (`-v`, which goes to
+    stdout when the archive itself arrives on stdin). Walking the destination
+    instead would count files that were already there — so a wholly failed
+    extract into a non-empty directory used to report a large `bytes_written`
+    and read as a success.
+    """
     into.mkdir(parents=True, exist_ok=True)
     # Normalise patterns to the `./...` form tar emits.
-    args = ["tar", "-xf", "-", "-C", str(into)]
+    args = ["tar", "-xvf", "-", "-C", str(into)]
     for pat in patterns:
         normalised = pat if pat.startswith("./") else "./" + pat.lstrip("/")
         # tar accepts trailing-slash subtree as a path; tell it to also
         # extract everything beneath via implicit prefix matching.
         args.append(normalised.rstrip("/"))
 
-    zstdcat = subprocess.Popen(
-        ["zstdcat", str(archive_path)],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-    )
-    assert zstdcat.stdout is not None
-    tar = subprocess.Popen(args, stdin=zstdcat.stdout, stderr=subprocess.DEVNULL)
-    zstdcat.stdout.close()
-    tar_rc = tar.wait()
-    zstdcat_rc = zstdcat.wait()
-    if tar_rc not in (0,):  # tar exits non-zero on partial matches; that's OK
-        pass
+    # tar's `-v` listing goes to stdout (the archive itself is on stdin), one
+    # line per member. Spool it to a temp file rather than a pipe: a whole-tree
+    # extract can name millions of members, and buffering that in memory to
+    # count it would be its own bug. stderr stays a pipe — it is bounded by the
+    # number of requested patterns.
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8",
+                                errors="surrogateescape") as listing:
+        zstdcat = subprocess.Popen(
+            ["zstdcat", str(archive_path)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        assert zstdcat.stdout is not None
+        tar = subprocess.Popen(args, stdin=zstdcat.stdout,
+                               stdout=listing, stderr=subprocess.PIPE,
+                               text=True)
+        # Close our copy so tar sees EOF when zstdcat exits.
+        zstdcat.stdout.close()
+        _, tar_err = tar.communicate()
+        tar_rc = tar.returncode
+        zstdcat_rc = zstdcat.wait()
 
-    # Count what landed; tar mode doesn't give us per-type stats cheaply,
-    # so just report what we can.
-    bytes_written = 0
-    n_files = 0
-    for root, _, files in os.walk(into):
-        for f in files:
+        if tar_rc != 0 and not _tar_stderr_is_only_benign(tar_err):
+            raise ExtractError(
+                f"tar exited {tar_rc} extracting from {archive_path.name}: "
+                f"{(tar_err or '').strip() or 'no diagnostic'}")
+        # Only trust zstdcat's status when tar itself succeeded: a tar that
+        # bailed early leaves zstdcat killed by SIGPIPE, which is not an
+        # archive fault.
+        if tar_rc == 0 and zstdcat_rc != 0:
+            raise ExtractError(
+                f"zstdcat exited {zstdcat_rc} reading {archive_path.name} — the "
+                f"archive may be truncated or corrupt")
+
+        # Tally exactly what tar said it wrote. Directory entries come through
+        # with a trailing slash; a size stat that fails is counted as a member
+        # but contributes no bytes.
+        bytes_written = 0
+        n_files = n_dirs = 0
+        listing.seek(0)
+        for line in listing:
+            name = line.strip()
+            if not name:
+                continue
+            # Defensive: tolerate a "link -> target" rendering if tar emits one.
+            name = name.split(" -> ", 1)[0]
+            if name.endswith("/"):
+                n_dirs += 1
+                continue
             try:
-                bytes_written += (Path(root) / f).stat().st_size
-                n_files += 1
+                out_path = _safe_out_path(name, into)
+            except ValueError:
+                continue
+            n_files += 1
+            try:
+                bytes_written += out_path.stat().st_size
             except OSError:
                 pass
 
     return ExtractStats(
         requested_patterns=len(patterns),
-        matched_files=n_files, matched_dirs=0, matched_symlinks=0, matched_hardlinks=0,
+        matched_files=n_files, matched_dirs=n_dirs, matched_symlinks=0,
+        matched_hardlinks=0,
         frames_read=0, nfs_bytes_read=0,
         bytes_written=bytes_written,
         seconds_total=time.monotonic() - started,

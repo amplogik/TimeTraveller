@@ -19,6 +19,13 @@ INCR_MODES = ("weekdays", "except_full", "every_n_days", "disabled")
 # hardcode the same allowlist for auditability and must be kept in sync.
 SYSTEM_PLAN_NAMES = frozenset({"system", "homes"})
 
+# The privileged restore helper. Lives here rather than beside the other four
+# helper paths in worker.py because the GUI needs it to pre-flight an
+# original-location restore, and the GUI otherwise never imports the worker (it
+# runs it as a subprocess). worker.RESTORE_HELPER_PATH aliases this so there is
+# exactly one literal.
+RESTORE_HELPER_PATH = "/usr/libexec/timetraveller-restore-system-files"
+
 
 @dataclass
 class FullSchedule:

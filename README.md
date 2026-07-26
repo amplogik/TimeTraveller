@@ -2,7 +2,7 @@
 
 A local Linux backup tool focused on **trustworthy backups** and **fast, partial recovery**.
 
-Status: **v1.5.3** — stable.
+Status: **v1.6.0** — stable.
 
 **Highlights since v1.0:**
 
@@ -130,6 +130,7 @@ You don't need a root shell to manage system-class plans from the GUI. **Every o
 - **Run full/incr now**
 - **Deleting** a cycle or a single backup
 - **Reindexing** a sidecar or **recovering** a failed-but-intact backup
+- **Restoring files to their original locations** (see [Restoring to original locations](#restoring-to-original-locations))
 
 Each is handled by its own narrow, auditable helper under `/usr/libexec/` authorised by a matching Polkit policy — the GUI never runs an arbitrary command as root. (Scheduled backups already run as root from cron, so they were never affected.)
 
@@ -204,6 +205,27 @@ To restore an *entire* cycle, the command line is more comfortable:
 timetraveller-backup --plan <name> --extract <archive>.pax.zst --into /restore/path .
 ```
 
+### Restoring to original locations
+
+The Restore dialog's **Original location…** button puts the selected files back exactly where they came from, **overwriting** the live copies. Archive members are stored with paths rooted at `/`, so "original location" just means extracting into the filesystem root.
+
+Most of those paths belong to root, so TimeTraveller checks whether you can actually write to the destination *before* writing anything — you never get a restore that stopped halfway:
+
+| Destination | What happens |
+|---|---|
+| `/` on a **system-class plan** in plan mode | Asks for an administrator password, then restores through a narrow privileged helper. Dismissing the prompt writes nothing. |
+| A path **you own** (the `~/Restored/…` default, anything in `$HOME`) | No prompt, no privileges — unchanged behaviour. |
+| Any **other root-owned** directory | Refused with an explanation. Stage the files somewhere you own and move them with `sudo`, or re-run the CLI under `sudo`. |
+| A drive opened with **Restore from location…** | No automatic escalation — extract to your home directory and move the files with `sudo`. |
+
+The last two are deliberate, not missing features. The helper (`/usr/libexec/timetraveller-restore-system-files`, authorised by `com.timetraveller.restore-system-files`) **hardcodes `/` as its destination and refuses any caller-supplied path**, and it derives the archive directory from the root-owned `/etc/timetraveller/<plan>.yaml`. That is what keeps it from being a general write-anywhere-as-root primitive: it can only put a plan's own archived members back where they came from. Restored files keep the ownership and permissions recorded in the archive — which is the whole reason the privileged path is needed, since an unprivileged extract cannot reproduce them.
+
+From the CLI, restoring to the original locations of a system plan escalates the same way:
+
+```bash
+timetraveller-backup --plan system --extract 2026-07-22T210655_full --into / ./usr/lib/vst/
+```
+
 ### Restoring from a drive with no plan configured
 
 You don't need the original machine or its config to get your files back. On any box with TimeTraveller installed, click **Restore from location…** in the toolbar and browse to where the backup lives — a USB drive, an external disk, or a mounted NAS share. TimeTraveller reads that location directly: the **Archives** tab fills with its cycles, and browsing, searching, and **Extract selected…** all work exactly as they do for a locally-configured plan.
@@ -227,6 +249,15 @@ A live filesystem changes under a snapshot-less backup — a browser rewrites a 
 - **ok** — clean.
 - **ok-with-warnings** — some files were skipped (vanished or changed mid-read), but the archive stream is structurally valid and trustworthy. This is normal for a busy home directory.
 - **failed** — the archive itself is not trustworthy (a fatal error, a compression failure, or unreadable diagnostics). Only these are treated as failures; retention won't prune around them, and the file is quarantined for `--recover-failed`.
+- **corrupt** — the stream wrote fine, but verify-after-write found persisted frames whose bytes no longer match the checksum recorded at write time. Shown in orange; the undamaged data still restores, and `--heal` pulls clean copies of the damaged files from another cycle.
+
+### "ok (unverified)" — written, but not checked
+
+Separate from the statuses above, a backup can be shown in muted grey as **ok (unverified)**. That means verify-after-write never actually reached a verdict for at least one shard — because the check hit an error, because the archive has no checksum-bearing sidecar to compare against (unframed or legacy), or because `verify_after_write` is off for that plan.
+
+This is a statement about *what is known*, not about damage: nothing is known to be wrong, but nothing has confirmed it is right either. It deliberately does **not** mark the cycle incomplete or change what retention prunes — an unverified backup is still a backup. The tooltip says which case applied, and `--verify <backup>` checks it on demand.
+
+It matters because the alternative is worse: previously all four of those outcomes recorded `corrupt_frames=0` and rendered exactly like a verified-clean backup, so "my backup is fine" was the default answer even for a backup nobody had checked. Archives written before v1.6.0 carry no verify state and are left unmarked rather than retroactively greyed out.
 
 ## Architecture
 

@@ -157,6 +157,51 @@ fallback when it isn't.</li>
 comfortable:</p>
 <pre><code>timetraveller-backup --plan &lt;name&gt; --extract &lt;archive&gt;.pax.zst --into /restore/path .</code></pre>
 
+<h2>Restoring files to their original locations</h2>
+<p>The Restore dialog's <b>Original location&hellip;</b> button puts the
+selected files back exactly where they came from, <b>overwriting</b> the live
+copies. Archive members are stored with paths rooted at <code>/</code>, so
+"original location" simply means extracting into the filesystem root.</p>
+<p>Most of those paths belong to root. TimeTraveller checks whether you can
+actually write to the destination <i>before</i> it writes anything, so you
+never end up with a restore that stopped halfway:</p>
+<ul>
+<li><b>A system-class plan</b> (<code>system</code> or <code>homes</code>)
+browsed through its own plan &mdash; you are asked for an administrator
+password, and the restore runs through a small privileged helper. Nothing is
+written if you dismiss the prompt.</li>
+<li><b>A destination you already own</b> (the default
+<code>~/Restored/&hellip;</code>, or anything under your home) &mdash; no
+prompt, no privileges, exactly as before.</li>
+<li><b>Any other root-owned destination</b> &mdash; TimeTraveller stops and
+tells you, rather than escalating. The privileged helper is deliberately
+restricted to putting files <i>back where they came from</i>; it will not write
+to an arbitrary directory. Stage the files somewhere you own and move them with
+<code>sudo</code>, or re-run the CLI under <code>sudo</code>.</li>
+<li><b>A drive opened with Restore from location&hellip;</b> &mdash; also no
+automatic escalation, for the same reason: the helper takes its archive
+directory from the root-owned plan config, never from a path handed to it, so
+it cannot be pointed at a browsed drive. Extract to your home directory and
+move the files into place with <code>sudo</code>.</li>
+</ul>
+<p>Restored files keep the ownership and permissions recorded in the archive,
+which is why the privileged path exists at all &mdash; an unprivileged extract
+of root-owned files cannot reproduce them.</p>
+
+<h2>&quot;ok (unverified)&quot; &mdash; written, but not checked</h2>
+<p>A backup shown in muted grey as <b>ok (unverified)</b> is one where
+verify-after-write never reached a verdict for at least one shard &mdash;
+the check hit an error, the archive has no checksum-bearing sidecar to compare
+against (unframed or legacy), or verification is switched off for that plan.</p>
+<p>This describes <i>what is known</i>, not damage: nothing is known to be
+wrong, but nothing has confirmed it is right either. It deliberately does
+<b>not</b> mark the cycle incomplete or change what retention prunes &mdash; an
+unverified backup is still a backup. Hover the row to see which case applied,
+and run <code>--verify &lt;backup&gt;</code> to check it on demand.</p>
+<p>Compare <b>corrupt</b> (orange): there, the check <i>did</i> run and found
+persisted frames that no longer match their write-time checksum. Archives
+written before v1.6.0 carry no verify state and are left unmarked.</p>
+
 <h2>Restoring from a drive with no plan configured</h2>
 <p>You don't need the original machine or its config to get your files back.
 On any box with TimeTraveller installed, click <b>Restore from

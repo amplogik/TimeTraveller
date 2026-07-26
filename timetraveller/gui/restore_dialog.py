@@ -18,7 +18,52 @@ from PyQt6.QtWidgets import (
     QPushButton, QVBoxLayout,
 )
 
-from ..extract import ExtractStats, extract_files
+from ..config import RESTORE_HELPER_PATH
+from ..extract import ExtractStats, dest_needs_root, extract_files
+
+
+class _PkexecRestoreWorker(QObject):
+    """Runs the privileged restore helper under pkexec, off the Qt thread.
+
+    Used only for restoring to the ORIGINAL locations of a system-class plan:
+    the helper hardcodes "/" as its destination and refuses a caller-supplied
+    path, so there is nothing else it can be pointed at. We surface its combined
+    output verbatim rather than synthesising an ExtractStats — the privileged run
+    happens in another process and reports its own tallies.
+    """
+
+    finished = pyqtSignal(str)      # combined helper output
+    failed = pyqtSignal(str)
+
+    def __init__(self, plan_name: str, backup_id: str, paths: list[str]):
+        super().__init__()
+        self._plan_name = plan_name
+        self._backup_id = backup_id
+        self._paths = paths
+
+    def run(self) -> None:
+        import subprocess
+        cmd = ["pkexec", RESTORE_HELPER_PATH, self._plan_name,
+               self._backup_id, *self._paths]
+        try:
+            r = subprocess.run(cmd, text=True, capture_output=True)
+        except OSError as exc:
+            self.failed.emit(
+                f"could not run pkexec ({exc}). Install the `pkexec` package, "
+                f"or extract to a directory you own and move the files with sudo.")
+            return
+        out = (r.stdout or "") + (r.stderr or "")
+        if r.returncode != 0:
+            # 126/127 are pkexec's own "dismissed / not authorised" codes.
+            if r.returncode in (126, 127):
+                self.failed.emit(
+                    "authentication was cancelled or refused, so nothing was "
+                    "restored.\n" + out.strip())
+            else:
+                self.failed.emit(
+                    f"restore helper exited {r.returncode}.\n" + out.strip())
+            return
+        self.finished.emit(out.strip() or "(helper produced no output)")
 
 
 class _ExtractWorker(QObject):
@@ -86,7 +131,9 @@ class RestoreDialog(QDialog):
     chosen destination."""
 
     def __init__(self, archives, paths: list[str], parent=None, *, label: str = "",
-                 original_sources: list[str] | None = None):
+                 original_sources: list[str] | None = None,
+                 plan_name: str | None = None, backup_id: str | None = None,
+                 can_escalate: bool = False):
         super().__init__(parent)
         self.setWindowTitle("Extract from backup")
         self.resize(900, 600)
@@ -94,12 +141,19 @@ class RestoreDialog(QDialog):
         # Accept a single Path (legacy) or a list of shard archive paths.
         self._archives = [archives] if isinstance(archives, Path) else list(archives)
         self._paths = paths
+        # Privileged-restore context. `can_escalate` is True only when the caller
+        # is in plan mode on a system-class plan — the pkexec helper derives the
+        # archive dir from the root-owned /etc/timetraveller/<plan>.yaml, so a
+        # source-mode (browsed drive) restore can never go through it.
+        self._plan_name = plan_name
+        self._backup_id = backup_id
+        self._can_escalate = bool(can_escalate and plan_name and backup_id)
         # Original filesystem root(s) the files came from (from the plan/descriptor).
         # Archive members are stored root-rooted (./home/kim/…), so restoring to
         # the original location means extracting into "/".
         self._original_sources = original_sources or []
         self._thread: QThread | None = None
-        self._worker: _ExtractWorker | None = None
+        self._worker: _ExtractWorker | _PkexecRestoreWorker | None = None
 
         layout = QVBoxLayout(self)
 
@@ -180,13 +234,22 @@ class RestoreDialog(QDialog):
         """Set the destination to the filesystem root so members restore to their
         original absolute paths — with a clear overwrite warning first."""
         from PyQt6.QtWidgets import QMessageBox
+        escalation_note = (
+            "These are system paths, so you will be asked for an administrator "
+            "password when you press <b>Extract</b>."
+            if self._can_escalate else
+            "If any of these paths need root, the extract will stop before "
+            "writing anything and tell you — this backup cannot be escalated "
+            "automatically."
+        )
         r = QMessageBox.warning(
             self, "Restore to original location?",
             "This restores the selected files to their <b>original locations</b> under "
             + ", ".join(self._original_sources)
             + ", <b>overwriting</b> any existing files there.<br><br>"
-            "System paths may require running TimeTraveller as root. To stage the "
-            "files somewhere safe instead, use <b>Browse…</b>.<br><br>Continue?",
+            + escalation_note
+            + " To stage the files somewhere safe instead, use <b>Browse…</b>."
+            "<br><br>Continue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         )
@@ -195,6 +258,16 @@ class RestoreDialog(QDialog):
 
     def _on_extract(self) -> None:
         dest = Path(self._dest.text()).expanduser()
+
+        # Pre-flight privileges BEFORE writing anything. An unprivileged extract
+        # into a root-owned tree otherwise fails partway through, leaving a
+        # half-restored mess on disk; and the old code's mkdir would report a
+        # confusing "cannot create destination" for what is really a
+        # needs-root condition.
+        if dest_needs_root(dest):
+            self._route_privileged(dest)
+            return
+
         try:
             dest.mkdir(parents=True, exist_ok=True)
         except OSError as e:
@@ -220,6 +293,87 @@ class RestoreDialog(QDialog):
         self._thread.finished.connect(self._worker.deleteLater)
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
+
+    def _route_privileged(self, dest: Path) -> bool:
+        """Handle a destination this user cannot write to.
+
+        Returns True if a privileged restore was started, False if we refused
+        (having already told the user why). Only an exactly-"/" destination is
+        eligible: the helper hardcodes "/" as where it writes, so sending a
+        request for some other root-owned directory through it would scatter the
+        files to their original locations instead of the one that was asked for.
+        """
+        from PyQt6.QtWidgets import QMessageBox
+
+        if dest.resolve() != Path("/"):
+            QMessageBox.warning(
+                self, "Destination needs root",
+                f"<b>{dest}</b> is not writable by your user, so nothing was "
+                "extracted.<br><br>"
+                "TimeTraveller can escalate automatically only for a restore to "
+                "the <b>original locations</b> of a system-class plan. For any "
+                "other root-owned destination, either pick a directory you own "
+                "(<b>Browse…</b>) or run the CLI under <tt>sudo</tt>.")
+            return False
+
+        if not self._can_escalate:
+            QMessageBox.warning(
+                self, "Cannot restore to original location",
+                "Restoring to <b>/</b> needs root, and this backup cannot be "
+                "escalated automatically.<br><br>"
+                "Automatic escalation applies to a <b>system-class plan</b> "
+                "(<tt>system</tt>/<tt>homes</tt>) browsed through its own plan — "
+                "not to a drive opened with <b>Restore from location…</b>, "
+                "because the privileged helper deliberately takes its archive "
+                "directory from the root-owned plan config rather than from a "
+                "path supplied by the caller.<br><br>"
+                "Extract to a directory you own instead, then move the files "
+                "into place with <tt>sudo</tt>.")
+            return False
+
+        r = QMessageBox.question(
+            self, "Authenticate to restore system files?",
+            f"Restoring {len(self._paths)} path(s) to their original locations "
+            "requires administrator rights, so you will be asked for a "
+            "password.<br><br>"
+            "The files will <b>overwrite</b> the live copies, and will be "
+            "restored with their original ownership and permissions.<br><br>"
+            "Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if r != QMessageBox.StandardButton.Yes:
+            self._status.setText("Cancelled — nothing was restored.")
+            return False
+
+        self._extract_btn.setEnabled(False)
+        self._output.clear()
+        self._output.appendPlainText(
+            f"Restoring {len(self._paths)} path(s) to their original locations "
+            f"via {RESTORE_HELPER_PATH}…")
+        self._output.appendPlainText("Waiting for authentication…")
+        self._status.setText("Authenticating…")
+
+        self._thread = QThread(self)
+        self._worker = _PkexecRestoreWorker(
+            self._plan_name, self._backup_id, list(self._paths))
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.finished.connect(self._on_privileged_finished)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.failed.connect(self._thread.quit)
+        self._thread.finished.connect(self._worker.deleteLater)
+        self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.start()
+        return True
+
+    def _on_privileged_finished(self, output: str) -> None:
+        self._output.appendPlainText(output)
+        self._status.setText(
+            "<span style='color:#2da44e'>Restored to original locations "
+            "(see output above).</span>")
+        self._close_btn.setDefault(True)
 
     def _on_finished(self, stats: ExtractStats) -> None:
         mode = "naive (whole-archive scan)" if stats.fallback_naive else "fast (sidecar-based)"

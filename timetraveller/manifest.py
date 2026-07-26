@@ -39,6 +39,18 @@ class ArchiveEntry:
     # post-write bit flip); the archive stays browsable/extractable so the good
     # frames restore and D2 can heal the damaged files from another cycle.
     corrupt_frames: int = 0
+    # What verify-after-write actually MANAGED to conclude. Without this,
+    # corrupt_frames=0 is ambiguous: it reads identically whether the shard was
+    # checked and found clean, the check threw, the archive had no
+    # checksum-bearing sidecar to check against, or verification was switched
+    # off entirely. "A backup nobody verified" must not look like "a verified
+    # backup". One of:
+    #   "verified"   - re-read and compared; trust corrupt_frames
+    #   "unverified" - nothing to compare against (unframed / legacy v1 sidecar)
+    #   "error"      - the check itself failed; corrupt_frames means nothing
+    #   "disabled"   - plan has verify_after_write off
+    #   ""           - not attempted (e.g. the shard failed) or a legacy entry
+    verify_state: str = ""
     has_sidecar: bool = False   # True if the .idx.zst sidecar exists for this archive
     has_frames: bool = False    # True if the .frames.json sidecar exists (framed-zstd archive)
     # Sharding: one logical backup may be split across N archive files ("shards"),
@@ -154,6 +166,28 @@ class ShardSet:
         if "ok-with-warnings" in sts:
             return "ok-with-warnings"
         return "ok"
+
+    @property
+    def verify_state(self) -> str:
+        """Worst verify outcome across the shards, most-concerning first.
+
+        Deliberately does NOT feed `status` or `is_complete`: an unverified shard
+        is a gap in what we know, not evidence of damage, and treating it as
+        corruption would change retention and mark healthy cycles incomplete.
+        It exists so the UI can say "nobody checked this" instead of implying a
+        clean bill of health.
+        """
+        states = {m.verify_state for m in self.members}
+        for s in ("error", "unverified", "disabled", "verified"):
+            if s in states:
+                return s
+        return ""
+
+    @property
+    def is_fully_verified(self) -> bool:
+        """True iff every shard was actually re-read and compared."""
+        return bool(self.members) and all(
+            m.verify_state == "verified" for m in self.members)
 
     @property
     def is_complete(self) -> bool:

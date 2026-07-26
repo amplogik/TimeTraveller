@@ -414,29 +414,99 @@ def _write_entry_meta(archive_dir: Path, m: manifestlib.Manifest,
         print(f"WARNING: {fname}: meta sidecar write failed: {e}", file=sys.stderr)
 
 
-def _verify_shard_after_write(archive_path: Path, plan: configlib.PlanConfig) -> list[dict]:
-    """D1: re-read a just-written shard from the store (cache-dropped) and return
-    its bad frame records — [] if verify is disabled, the archive is unframed, or
-    it verifies clean. A read error is logged and treated as 'not verified' ([]),
-    never as corruption, so a transient NFS hiccup can't fail an otherwise-good
-    backup.
+def _verify_shard_after_write(archive_path: Path,
+                              plan: configlib.PlanConfig) -> tuple[str, list[dict]]:
+    """D1: re-read a just-written shard from the store (cache-dropped) and report
+    (verify_state, bad_frame_records).
+
+    A read error is still never treated as corruption — a transient NFS hiccup
+    must not fail an otherwise-good backup. But it is no longer indistinguishable
+    from success either: the returned state says which of these happened, so the
+    manifest can record "nobody checked this" separately from "checked, clean".
+    Returning a bare [] for all four outcomes is what made corrupt_frames=0
+    unfalsifiable and cost three days chasing a corruption bug that did not exist.
 
     Runs inside the shard's writer thread so it overlaps sibling-shard writes;
     the cache-drop makes it read what actually LANDED, not the client buffer."""
     if not plan.verify_after_write:
-        return []
+        return "disabled", []
     try:
         res = heallib.verify_frame_checksums(archive_path, drop_cache=True)
     except Exception as e:  # noqa: BLE001 - a verify safety-net must NEVER fail an
         # otherwise-good backup: any error here (read hiccup, malformed sidecar)
-        # is treated as "not verified", logged, and the backup stands.
+        # is recorded as "error", logged, and the backup stands.
         print(f"WARNING: {archive_path.name}: verify-after-write error: {e}; "
               f"shard not verified", file=sys.stderr)
-        return []
+        return "error", []
     if res is None:
-        return []  # unframed / legacy: no per-frame csums to check
+        # Unframed / legacy v1 sidecar: no per-frame csums to compare against.
+        return "unverified", []
     _algo, _n, bad = res
-    return bad
+    return "verified", bad
+
+
+def _append_to_log(log_path: Path, msg: str) -> None:
+    """Append one line to a plan/shard log file. Best-effort — a logging failure
+    must never fail a backup.
+
+    Needed because `_log()` only writes stdout, and the cron entries this tool
+    installs do not redirect it (see schedule.py), so on a scheduled or pkexec
+    run everything `_log()` says goes to cron mail at best and /dev/null at
+    worst. Verify diagnostics in particular have to land somewhere durable: the
+    package now owns /var/log/timetraveller precisely so this survives a rebuild.
+    """
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a") as f:
+            f.write(f"{datetime.now(timezone.utc).isoformat()} {msg}\n")
+    except OSError as e:
+        print(f"WARNING: could not append to {log_path}: {e}", file=sys.stderr)
+
+
+_VERIFY_STATE_NOTE = {
+    "error": "verify-after-write could not complete — this shard was NOT checked; "
+             "corrupt_frames says nothing about it",
+    "unverified": "no checksum-bearing sidecar to verify against (unframed or "
+                  "legacy archive) — this shard was NOT checked",
+    "disabled": "verify-after-write is disabled for this plan — this shard was "
+                "NOT checked",
+}
+
+
+def _record_verify_states(m: manifestlib.Manifest, archive_dir: Path,
+                          specs: list, verify_states: list,
+                          args: argparse.Namespace) -> int:
+    """Record what verify-after-write concluded for each shard, and count the
+    ones that were not actually checked.
+
+    Kept separate from `_mark_corrupt_shards` on purpose: this records what we
+    KNOW, that one records what is WRONG. An unverified shard is a gap in
+    knowledge, not damage — it does not make the cycle incomplete and does not
+    block retention.
+
+    The reason is written to the shard's own log FILE, not just stderr/stdout: on
+    a cron or pkexec run neither stream is captured anywhere, which is exactly
+    why the original "shard not verified" warning left no trace."""
+    nunverified = 0
+    for (sfname, _sapath, _files, slog), state in zip(specs, verify_states):
+        if not state:
+            continue          # not attempted (e.g. the shard failed outright)
+        entry = next((e for e in m.archives if e.filename == sfname), None)
+        if entry is None:
+            continue
+        entry.verify_state = state
+        if state == "verified":
+            _write_entry_meta(archive_dir, m, sfname, args)
+            _append_to_log(slog, f"VERIFIED: {sfname}: re-read and compared clean")
+            continue
+        nunverified += 1
+        note = _VERIFY_STATE_NOTE[state]
+        entry.notes = f"{entry.notes}; {note}" if entry.notes else note
+        _write_entry_meta(archive_dir, m, sfname, args)
+        print(f"WARNING: {sfname}: {note}", file=sys.stderr)
+        _log(args, f"UNVERIFIED: {sfname}: {note}")
+        _append_to_log(slog, f"UNVERIFIED: {sfname}: {note}")
+    return nunverified
 
 
 def _mark_corrupt_shards(m: manifestlib.Manifest, archive_dir: Path,
@@ -447,7 +517,7 @@ def _mark_corrupt_shards(m: manifestlib.Manifest, archive_dir: Path,
     left in place — they stay browsable/extractable so the good frames restore
     and D2 (--heal) can recover the damaged files from another cycle."""
     ncorrupt = 0
-    for (sfname, sapath, _files, _slog), bad in zip(specs, verify_bad):
+    for (sfname, sapath, _files, slog), bad in zip(specs, verify_bad):
         if not bad:
             continue
         ncorrupt += 1
@@ -464,6 +534,9 @@ def _mark_corrupt_shards(m: manifestlib.Manifest, archive_dir: Path,
         print(f"ERROR: {sfname}: {note}", file=sys.stderr)
         _log(args, f"CORRUPT: {sfname}: {len(bad)} bad frame(s), "
                    f"{len(files)} file(s) affected")
+        # Durable too — same reasoning as _record_verify_states: a scheduled run
+        # captures neither stdout nor stderr.
+        _append_to_log(slog, f"CORRUPT: {sfname}: {note}")
     return ncorrupt
 
 
@@ -937,6 +1010,29 @@ def action_extract(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
         return 1
     into = args.into if args.into is not None else Path.cwd()
 
+    # Pre-flight the destination's writability BEFORE any bytes are written. An
+    # unprivileged extract into a root-owned tree otherwise dies partway through
+    # `_write_records`, leaving a half-finished restore on disk — worse than not
+    # starting. Two outcomes:
+    #   * destination is exactly "/" on a system-class plan -> that is the
+    #     "restore to original location" case the pkexec helper exists for.
+    #   * anything else -> refuse with an actionable message. We must NOT
+    #     escalate here: the helper hardcodes "/" as its destination, so routing
+    #     a `--into /opt/foo` request through it would silently scatter the files
+    #     to their original locations instead of the requested directory.
+    if extractlib.dest_needs_root(into):
+        if into.resolve() == Path("/") and _needs_root_escalation(plan):
+            return _restore_via_pkexec(args, plan, args.extract, list(args.paths))
+        print(f"--extract: destination {into} is not writable by this user.\n"
+              f"  Restoring to the ORIGINAL locations of a system-class plan "
+              f"(--into /) escalates via pkexec automatically.\n"
+              f"  For any other root-owned destination, re-run under sudo:\n"
+              f"    sudo timetraveller-backup --plan {plan.plan_name} "
+              f"--extract {args.extract} --into {into} ...\n"
+              f"  Or choose a destination you own (e.g. --into ~/Restored).",
+              file=sys.stderr)
+        return 1
+
     # Extract the requested paths from every shard and sum the results. Each
     # member lives in exactly one shard, so there's no overlap to de-dup; a
     # shard that holds none of the requested paths simply contributes nothing.
@@ -1177,6 +1273,32 @@ def _needs_root_escalation(plan: configlib.PlanConfig) -> bool:
     privileged run does the real work instead of re-escalating."""
     return (plan.plan_name in configlib.SYSTEM_PLAN_NAMES
             and os.geteuid() != 0)
+
+
+def _restore_via_pkexec(args: argparse.Namespace, plan: configlib.PlanConfig,
+                        identifier: str, paths: list[str]) -> int:
+    """Restore members back to their original locations as root, via the pkexec
+    helper.
+
+    The helper hardcodes the destination as "/" and refuses a caller-supplied
+    path, so this is only ever reachable for an original-location restore — see
+    `_route_extract` for the guard that establishes that. We normalise the
+    identifier to a shard-group stem first because the helper's strict charset
+    check rejects dots, and callers legitimately pass a shard filename.
+    """
+    import subprocess
+    stem = manifestlib._group_id_from_filename(identifier)
+    cmd = ["pkexec", RESTORE_HELPER_PATH, plan.plan_name, stem, *paths]
+    _log(args, f"Restoring {len(paths)} path(s) of {stem} to their original "
+               f"locations via pkexec {RESTORE_HELPER_PATH}")
+    r = subprocess.run(cmd, text=True, capture_output=True)
+    if r.stdout:
+        sys.stdout.write(r.stdout)
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr or "")
+        print(f"\nERROR: restore helper exited {r.returncode}", file=sys.stderr)
+        return r.returncode
+    return 0
 
 
 def _delete_via_pkexec(args: argparse.Namespace, plan: configlib.PlanConfig,
@@ -1685,6 +1807,7 @@ PKEXEC_HELPER_PATH = "/usr/libexec/timetraveller-install-system-cron"
 DELETE_HELPER_PATH = "/usr/libexec/timetraveller-delete-system-archives"
 BACKUP_HELPER_PATH = "/usr/libexec/timetraveller-run-system-backup"
 MAINT_HELPER_PATH = "/usr/libexec/timetraveller-maintain-system-archive"
+RESTORE_HELPER_PATH = configlib.RESTORE_HELPER_PATH
 
 
 def _default_installed_binary() -> str:
@@ -2043,10 +2166,14 @@ def action_backup(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
     # Each shard verifies in its own writer thread the instant its write returns,
     # so the re-read overlaps sibling shards still writing (measured ~free).
     verify_bad: list = [[] for _ in range(n)]
+    # verify_states[i] records what verify MANAGED to conclude for shard i:
+    # verified / unverified / error / disabled, or "" if it was never attempted.
+    verify_states: list = ["" for _ in range(n)]
     if n == 1:
         results[0] = _run_spec(specs[0])
         if results[0].status in ("ok", "ok-with-warnings"):
-            verify_bad[0] = _verify_shard_after_write(specs[0][1], plan)
+            verify_states[0], verify_bad[0] = _verify_shard_after_write(
+                specs[0][1], plan)
     else:
         errs: dict = {}
 
@@ -2054,7 +2181,8 @@ def action_backup(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
             try:
                 results[i] = _run_spec(specs[i])
                 if results[i].status in ("ok", "ok-with-warnings"):
-                    verify_bad[i] = _verify_shard_after_write(specs[i][1], plan)
+                    verify_states[i], verify_bad[i] = _verify_shard_after_write(
+                        specs[i][1], plan)
             except BaseException as exc:  # noqa: BLE001 - surface after join
                 errs[i] = exc
 
@@ -2068,7 +2196,10 @@ def action_backup(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
 
     statuses = [_finalize_one(m, sapath, sfname, result, plan, args, slog)
                 for (sfname, sapath, _files, slog), result in zip(specs, results)]
-    # Fold in verify-after-write: any shard with bad frames becomes `corrupt`.
+    # Fold in verify-after-write. Record what each shard's verify concluded
+    # first, then flag any shard with bad frames as `corrupt` (which rewrites the
+    # same meta sidecar with the stronger status).
+    nunverified = _record_verify_states(m, archive_dir, specs, verify_states, args)
     ncorrupt = _mark_corrupt_shards(m, archive_dir, specs, verify_bad, args)
     _save_manifest(m, archive_dir, plan.plan_name)
     _write_restore_descriptor(archive_dir, plan)
@@ -2097,6 +2228,16 @@ def action_backup(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
         _log(args, f"Backup INCOMPLETE ({ncorrupt}/{n} shard(s) corrupt): "
                    f"{_hms(total)} total.")
         return 1
+    if nunverified:
+        # Not a failure — the backup wrote fine and nothing is known to be wrong.
+        # But it is NOT a verified backup either, and saying so plainly is the
+        # only thing that stops "clean" being the default assumption.
+        print(f"WARNING: {nunverified} of {n} shard(s) could not be verified; "
+              f"this cycle is written but UNVERIFIED. Re-check with:  --verify "
+              f"{stem}", file=sys.stderr)
+        _log(args, f"Backup complete but UNVERIFIED ({nunverified}/{n} shard(s) "
+                   f"not checked): {_hms(total)} total.")
+        return 0
     _log(args, f"Backup complete: {_hms(total)} total.")
     return 0
 

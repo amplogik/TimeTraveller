@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Privileged helper to restore files from a system-class plan's archives back
+to their ORIGINAL locations (i.e. extract with the filesystem root as the
+destination).
+
+Invoked via pkexec by the unprivileged GUI/CLI. We run as root here, and unlike
+the other four helpers this one writes to arbitrary points in the live
+filesystem — so it is the most security-sensitive of the set. The containment
+rules, in order of importance:
+
+ - **The destination is NOT a parameter.** It is hardcoded to "/" below. The
+   whole purpose of this helper is "put these members back where they came
+   from"; accepting a caller-supplied --into would turn it into a
+   write-anywhere-as-root primitive. Any other destination is, by definition,
+   somewhere the invoking user could have written to themselves, so it needs no
+   helper at all.
+ - The plan name must be in a fixed allowlist (system, homes) — same set as the
+   cron/config/delete helpers.
+ - We do NOT accept an archive path from the caller. We re-exec the *canonical*,
+   hardcoded timetraveller-backup binary with a *fixed* argument vector (no
+   shell), pointing it at /etc/timetraveller/<plan>.yaml. The worker derives the
+   archive directory from that root-owned config, so the read side is contained
+   to this plan's own archive tree and the caller cannot redirect it.
+ - The backup identifier must pass a strict charset check (alphanumerics, dash,
+   underscore) — no dots, no slashes. That restricts it to a shard-group stem
+   like `2026-07-22T210655_full`, which is what the GUI has in hand anyway, and
+   it can neither traverse paths nor name a sidecar.
+ - Every member path must look like an archive member (`./`-prefixed, no `..`
+   component, no NUL, no control characters) and there are hard caps on the
+   count and length. The `./` requirement doubles as argv-injection defence: a
+   member can never be mistaken for an option by the worker's argument parser.
+
+> Residual risk, accepted deliberately: extracting as root to "/" follows any
+> symlink already present at the destination, and restores whatever ownership
+> and modes the archive recorded. That is inherent to "restore system files to
+> their original location" and is the same exposure `tar -x` as root has always
+> had. It is bounded here by the archive dir coming from a root-owned config, so
+> the archive set is trusted to the same degree as /etc/timetraveller itself.
+> A caller cannot use this helper to write a path that is not a member of that
+> plan's own backup.
+
+Usage (called by pkexec):
+    timetraveller-restore-system-files <plan> <backup-stem> <member> [<member>...]
+
+Exit codes: 2 validation refusal, 3 environment problem (missing config or
+binary), 4 not root, 64 usage error; otherwise the worker's own exit code.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+
+# Plan names whose archives this helper is allowed to restore from. Kept in sync
+# with timetraveller.config.SYSTEM_PLAN_NAMES.
+ALLOWED_PLANS = frozenset({"system", "homes"})
+
+# The only binaries we will re-exec. Hardcoded so this helper can't be tricked
+# into running an arbitrary program as root.
+ALLOWED_BINARIES = (
+    "/usr/bin/timetraveller-backup",
+    "/usr/local/bin/timetraveller-backup",
+)
+
+ETC_DIR = "/etc/timetraveller"
+
+# The destination is fixed, never taken from the caller. See the module
+# docstring — this is the single most important line in the file.
+RESTORE_INTO = "/"
+
+# A shard-group stem ("2026-07-22T210655_full", "2026-06-14_incr") or a cycle
+# id. Deliberately excludes '.' and '/' so it can neither escape the archive dir
+# nor name a sidecar/extension.
+IDENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-]{0,63}$")
+
+# Caps. A restore of tens of thousands of individual members should go through a
+# subtree pattern (`./usr/lib/vst/`) rather than an argv of that size, and an
+# unbounded argv is its own denial-of-service surface.
+MAX_MEMBERS = 4096
+MAX_MEMBER_LEN = 4096
+
+
+def fail(msg: str, code: int = 2) -> None:
+    print(f"timetraveller-restore-system-files: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def validate_plan(plan: str) -> None:
+    if plan not in ALLOWED_PLANS:
+        fail(f"refusing: plan {plan!r} not in allowed set {sorted(ALLOWED_PLANS)}")
+
+
+def validate_ident(ident: str) -> None:
+    if not IDENT_RE.match(ident):
+        fail(f"refusing: backup identifier {ident!r} fails the strict charset check")
+
+
+def validate_member(member: str) -> None:
+    """Accept only something that looks like a `./`-rooted archive member.
+
+    The `./` prefix is load-bearing twice over: it is how pax stores members, and
+    it guarantees the string cannot be read as an option by the worker's argument
+    parser downstream.
+    """
+    if len(member) > MAX_MEMBER_LEN:
+        fail(f"refusing: member path exceeds {MAX_MEMBER_LEN} bytes")
+    if not member.startswith("./"):
+        fail(f"refusing: member {member!r} is not './'-rooted "
+             f"(archive members are stored as './path/to/file')")
+    if "\0" in member:
+        fail(f"refusing: member {member!r} contains NUL")
+    if any(ord(c) < 0x20 for c in member):
+        fail(f"refusing: member {member!r} contains control characters")
+    # Reject traversal in any position, including a bare trailing '..'.
+    if any(part == ".." for part in member.split("/")):
+        fail(f"refusing: member {member!r} contains a '..' component")
+
+
+def canonical_binary() -> str:
+    for p in ALLOWED_BINARIES:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    fail("no canonical timetraveller-backup binary found", code=3)
+
+
+def build_command(plan: str, ident: str, members: list[str]) -> list[str]:
+    """Construct the fixed argv to re-exec. Every input is validated first.
+
+    The config path is computed from the plan name against a fixed prefix — never
+    taken from the caller — so the archive dir the worker derives from it stays
+    contained to this plan's tree. `--into` is our own constant.
+    """
+    validate_plan(plan)
+    validate_ident(ident)
+    if not members:
+        fail("refusing: no member paths given", code=64)
+    if len(members) > MAX_MEMBERS:
+        fail(f"refusing: {len(members)} members exceeds the cap of {MAX_MEMBERS}; "
+             f"restore a subtree (e.g. './usr/lib/vst/') instead")
+    for m in members:
+        validate_member(m)
+
+    config = os.path.join(ETC_DIR, f"{plan}.yaml")
+    if not os.path.isfile(config):
+        fail(f"refusing: config {config} does not exist", code=3)
+
+    return [canonical_binary(), "--plan", plan, "--config", config,
+            "--extract", ident, "--into", RESTORE_INTO, *members]
+
+
+def main(argv: list[str]) -> int:
+    if os.geteuid() != 0:
+        fail("must be run as root (typically via pkexec)", code=4)
+
+    if len(argv) < 3:
+        fail("usage: <plan> <backup-stem> <member> [<member>...]", code=64)
+
+    plan, ident, members = argv[0], argv[1], list(argv[2:])
+    cmd = build_command(plan, ident, members)
+    # No shell; fixed argv.
+    return subprocess.run(cmd).returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

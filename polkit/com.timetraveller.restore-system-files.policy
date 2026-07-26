@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+
+  <vendor>TimeTraveller</vendor>
+  <vendor_url>https://github.com/timetraveller</vendor_url>
+
+  <action id="com.timetraveller.restore-system-files">
+    <description>Restore TimeTraveller system-class backup files to their original locations</description>
+    <message>Authentication is required to restore backed-up files to their original system locations, overwriting the live files.</message>
+
+    <defaults>
+      <!-- Disallow remote/inactive sessions. Active local session must auth
+           as an admin; auth is cached for 5 minutes (auth_admin_keep) so
+           consecutive operations don't re-prompt. -->
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+
+    <!-- The helper script we are authorising. PolicyKit will execute it as
+         root after a successful authentication. The helper hardcodes the
+         destination as "/" and refuses any caller-supplied path, so this
+         action grants "put this plan's own archived members back where they
+         came from" and nothing wider. -->
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/timetraveller-restore-system-files</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+
+</policyconfig>

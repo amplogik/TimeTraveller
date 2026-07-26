@@ -25,7 +25,7 @@ from ..archive import (
     CycleListing, IndexNode, list_for_plan, list_from_manifest,
     load_sidecar_tree, merge_sidecar_trees,
 )
-from ..config import PlanConfig
+from ..config import SYSTEM_PLAN_NAMES, PlanConfig
 from ..index import sidecar_mirror_path, sidecar_path
 from ..manifest import ArchiveEntry
 from .archive_tree_model import ArchiveTreeModel
@@ -196,6 +196,19 @@ class ArchivePanel(QWidget):
     def _in_source_mode(self) -> bool:
         return self._source_dir is not None
 
+    def _can_escalate_restore(self) -> bool:
+        """True when an original-location restore may go through the pkexec
+        helper: plan mode on a system-class plan.
+
+        Source mode is excluded by design, not by omission — the helper takes its
+        archive directory from the root-owned /etc/timetraveller/<plan>.yaml and
+        refuses any caller-supplied path, so there is no way to point it at a
+        browsed drive.
+        """
+        return (not self._in_source_mode()
+                and self._plan is not None
+                and self._plan.plan_name in SYSTEM_PLAN_NAMES)
+
     def _adir(self) -> Path | None:
         """The directory archives are read from: the browsed source dir in
         source mode, else the active plan's archive dir."""
@@ -309,6 +322,27 @@ class ArchivePanel(QWidget):
                 tip = (f"{nbad} corrupt frame(s) found by verify-after-write. The "
                        f"undamaged data still restores; right-click → Recover damaged "
                        f"files to pull clean copies from another cycle.")
+                child.setToolTip(0, tip)
+                child.setToolTip(2, tip)
+            elif s.verify_state in ("error", "unverified", "disabled"):
+                # Wrote fine, but verify-after-write never actually concluded for
+                # at least one shard — so we do NOT know it is clean. Muted grey
+                # rather than a warning colour: this is missing knowledge, not
+                # detected damage. Without it, an unchecked backup renders
+                # identically to a verified one.
+                child.setForeground(0, _color("#6e7781"))
+                child.setForeground(2, _color("#6e7781"))
+                child.setText(2, f"{s.status} (unverified)")
+                why = {
+                    "error": "verify-after-write could not complete (e.g. a read "
+                             "error), so this backup was never checked",
+                    "unverified": "no checksum-bearing sidecar to verify against "
+                                  "— an unframed or legacy archive",
+                    "disabled": "verify-after-write is disabled for this plan",
+                }[s.verify_state]
+                tip = (f"Written, but NOT verified: {why}. Nothing is known to be "
+                       f"wrong — but nothing has confirmed it is right either. "
+                       f"Run --verify {s.group_id} to check it now.")
                 child.setToolTip(0, tip)
                 child.setToolTip(2, tip)
             elif s.status == "empty":
@@ -766,7 +800,10 @@ class ArchivePanel(QWidget):
             uniq = [p for p in paths if not (p in seen or seen.add(p))]
             archive_paths = [adir / m.filename for m in s.members]
             dlg = RestoreDialog(archive_paths, uniq, parent=self,
-                                label=_set_label(s), original_sources=sources)
+                                label=_set_label(s), original_sources=sources,
+                                plan_name=self._plan.plan_name,
+                                backup_id=s.group_id,
+                                can_escalate=self._can_escalate_restore())
             dlg.exec()
 
     def _scroll_to_path(self, path: str) -> None:
@@ -876,7 +913,10 @@ class ArchivePanel(QWidget):
         archive_paths = [adir / m.filename for m in self._current_set.members]
         dlg = RestoreDialog(archive_paths, paths, parent=self,
                             label=_set_label(self._current_set),
-                            original_sources=list(self._plan.sources) if self._plan else None)
+                            original_sources=list(self._plan.sources) if self._plan else None,
+                            plan_name=self._plan.plan_name,
+                            backup_id=self._current_set.group_id,
+                            can_escalate=self._can_escalate_restore())
         dlg.exec()
         # Selection might have been invalidated by user interaction; refresh.
         self._update_selection_label()
