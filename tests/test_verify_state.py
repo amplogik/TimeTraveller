@@ -75,7 +75,7 @@ def test_reports_verified_when_check_ran(tmp_path, monkeypatch):
     plan = defaults_system()
     plan.verify_after_write = True
     monkeypatch.setattr(worker.heallib, "verify_frame_checksums",
-                        lambda *a, **k: ("sha256", 10, []))
+                        lambda *a, **k: ("sha256", 10, [], []))
     state, bad = worker._verify_shard_after_write(tmp_path / "a.pax.zst", plan)
     assert state == "verified"
     assert bad == []
@@ -87,7 +87,7 @@ def test_verified_is_reported_even_when_frames_are_bad(tmp_path, monkeypatch):
     plan = defaults_system()
     plan.verify_after_write = True
     monkeypatch.setattr(worker.heallib, "verify_frame_checksums",
-                        lambda *a, **k: ("sha256", 10, [{"id": 3}]))
+                        lambda *a, **k: ("sha256", 10, [{"id": 3}], []))
     state, bad = worker._verify_shard_after_write(tmp_path / "a.pax.zst", plan)
     assert state == "verified"
     assert bad == [{"id": 3}]

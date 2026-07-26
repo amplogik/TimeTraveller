@@ -441,7 +441,15 @@ def _verify_shard_after_write(archive_path: Path,
     if res is None:
         # Unframed / legacy v1 sidecar: no per-frame csums to compare against.
         return "unverified", []
-    _algo, _n, bad = res
+    _algo, _n, bad, transient = res
+    if transient:
+        # Frames that failed a read but passed on retry (or read differently each
+        # time). Nothing is condemned, but a flaky link to the store is worth
+        # saying out loud rather than swallowing.
+        kinds = ", ".join(sorted({fr.get("anomaly", "?") for fr in transient}))
+        print(f"WARNING: {archive_path.name}: {len(transient)} frame(s) needed a "
+              f"re-read to verify ({kinds}); not treated as corruption, but the "
+              f"link to the backup store looks unreliable", file=sys.stderr)
     return "verified", bad
 
 
@@ -1097,19 +1105,24 @@ def _resolve_verify_targets(archive_dir: Path, identifier: str) -> list[Path]:
     return [p] if p is not None else []
 
 
-def _verify_frames(archive_path: Path) -> tuple[str, int, list[dict]] | None:
+def _verify_frames(archive_path: Path) -> tuple[str, int, list[dict], list[dict]] | None:
     """Decompress-free integrity check using the v2 frames.json `csum` digests.
 
-    Thin wrapper over heal.verify_frame_checksums that narrows each bad frame to
-    the {id, uo, ul} shape action_verify reports. Returns (algo, frame_count,
-    bad_frames), or None if no v2 (csum-bearing) sidecar exists — the caller
-    then falls back to a full decompress.
+    Thin wrapper over heal.verify_frame_checksums that narrows each frame to the
+    {id, uo, ul} shape action_verify reports. Returns (algo, frame_count,
+    bad_frames, transient_frames), or None if no v2 (csum-bearing) sidecar exists
+    — the caller then falls back to a full decompress.
     """
     res = heallib.verify_frame_checksums(archive_path)
     if res is None:
         return None
-    algo, nframes, bad = res
-    return (algo, nframes, [{"id": fr["id"], "uo": fr["uo"], "ul": fr["ul"]} for fr in bad])
+    algo, nframes, bad, transient = res
+
+    def narrow(frs, extra=()):
+        return [{k: fr[k] for k in ("id", "uo", "ul")} | {e: fr.get(e) for e in extra}
+                for fr in frs]
+
+    return (algo, nframes, narrow(bad), narrow(transient, ("anomaly",)))
 
 
 def action_verify(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
@@ -1121,12 +1134,21 @@ def action_verify(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
         return 1
 
     overall_ok = True
+    # filename -> True if it verified clean, False if confirmed corrupt. Archives
+    # we could not conclude about are absent, so reconciliation leaves them be.
+    verdicts: dict[str, bool] = {}
     for archive in targets:
         res = _verify_frames(archive)
         if res is not None:
-            algo, nframes, bad = res
+            algo, nframes, bad, transient = res
+            if transient:
+                kinds = ", ".join(sorted({str(t.get("anomaly")) for t in transient}))
+                print(f"verify: {archive.name}: {len(transient)} frame(s) only "
+                      f"verified after a re-read ({kinds}) — not corruption, but "
+                      f"the link to the store looks unreliable", file=sys.stderr)
             if bad:
                 overall_ok = False
+                verdicts[archive.name] = False
                 print(f"verify: {archive.name} FAILED — {len(bad)}/{nframes} "
                       f"corrupt frame(s) [{algo}]", file=sys.stderr)
                 for b in bad[:20]:
@@ -1136,6 +1158,7 @@ def action_verify(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
                 if len(bad) > 20:
                     print(f"    ... and {len(bad) - 20} more", file=sys.stderr)
             else:
+                verdicts[archive.name] = True
                 print(f"verify: {archive.name} OK "
                       f"({nframes} frames, {algo}, decompress-free)")
             continue
@@ -1157,7 +1180,89 @@ def action_verify(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
                 print(err.decode(errors="replace"), file=sys.stderr)
         else:
             print(f"verify: {archive.name} OK (full decompress)")
+
+    rc = _reconcile_after_verify(args, plan, archive_dir, verdicts)
+    if rc is not None:
+        return rc
     return 0 if overall_ok else 1
+
+
+def _reconcile_after_verify(args: argparse.Namespace, plan: configlib.PlanConfig,
+                            archive_dir: Path, verdicts: dict[str, bool]) -> int | None:
+    """Bring the manifest into line with what --verify just measured.
+
+    Without this a verify result is purely advisory, so a FALSE corrupt flag is
+    permanent: `_mark_corrupt_shards` can set `status="corrupt"` from a single
+    bad read, and nothing short of hand-editing manifest.json ever clears it —
+    while it is set, the full is demoted out of its own cycle. That happened to
+    bast's 2026-07-19 system full.
+
+    Returns an exit code if it handled things (including escalation), or None to
+    let the caller report the verify result normally.
+    """
+    if not verdicts:
+        return None
+    mpath = manifestlib.manifest_path(archive_dir)
+    m = manifestlib.load(mpath)
+    if not m.plan_name:
+        m.plan_name = plan.plan_name
+
+    changes: list[str] = []
+    for e in m.archives:
+        verdict = verdicts.get(e.filename)
+        if verdict is None:
+            continue
+        if verdict:
+            # Verified clean. Clear any stale corruption record.
+            if e.corrupt_frames or e.status == "corrupt":
+                was = f"{e.status}, {e.corrupt_frames} corrupt frame(s)"
+                e.corrupt_frames = 0
+                if e.status == "corrupt":
+                    # We cannot recover whether it was "ok" or "ok-with-warnings"
+                    # before it was marked corrupt — that nuance is lost, and the
+                    # note below records what it was.
+                    e.status = "ok"
+                note = (f"re-verified clean on "
+                        f"{datetime.now(timezone.utc).date().isoformat()}; "
+                        f"cleared corrupt flag (was: {was})")
+                e.notes = f"{e.notes}; {note}" if e.notes else note
+                changes.append(f"  {e.filename}: corrupt -> ok ({was})")
+            if e.verify_state != "verified":
+                e.verify_state = "verified"
+                if not changes or not changes[-1].startswith(f"  {e.filename}:"):
+                    changes.append(f"  {e.filename}: verify_state -> verified")
+        else:
+            # Confirmed corrupt (survived the retries) but recorded as fine.
+            if not e.corrupt_frames and e.status != "corrupt":
+                e.status = "corrupt"
+                e.verify_state = "verified"
+                note = (f"marked corrupt by --verify on "
+                        f"{datetime.now(timezone.utc).date().isoformat()}")
+                e.notes = f"{e.notes}; {note}" if e.notes else note
+                changes.append(f"  {e.filename}: ok -> corrupt")
+
+    if not changes:
+        return None
+
+    # The on-mount manifest of a system-class plan is root-owned. Only escalate
+    # once we know there is something to write — a plain clean verify must not
+    # provoke a password prompt.
+    if _needs_root_escalation(plan):
+        print("verify: manifest needs updating; re-running as root to record it.")
+        return _maint_via_pkexec(args, plan, "--verify", args.verify)
+
+    try:
+        _save_manifest(m, archive_dir, plan.plan_name)
+    except OSError as e:
+        print(f"verify: could not update the manifest ({e}).\n"
+              f"  Re-run under sudo to record the result:\n"
+              f"    sudo timetraveller-backup --plan {plan.plan_name} "
+              f"--verify {args.verify}", file=sys.stderr)
+        return None
+    print("verify: manifest updated —")
+    for c in changes:
+        print(c)
+    return None
 
 
 def _archives_newest_first(archive_dir: Path, m: manifestlib.Manifest,

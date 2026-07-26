@@ -2,7 +2,7 @@
 
 A local Linux backup tool focused on **trustworthy backups** and **fast, partial recovery**.
 
-Status: **v1.6.0** — stable.
+Status: **v1.6.1** — stable.
 
 **Highlights since v1.0:**
 
@@ -43,7 +43,7 @@ The underlying tools — `pax` and `zstd` — already do all of this well. TimeT
 Download the `.deb` from the [latest release](https://github.com/amplogik/TimeTraveller/releases) and install:
 
 ```bash
-sudo apt install ./timetraveller_1.4.3_all.deb
+sudo apt install ./timetraveller_1.6.1_all.deb
 ```
 
 This installs:

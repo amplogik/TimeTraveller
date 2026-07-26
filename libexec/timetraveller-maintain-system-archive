@@ -31,7 +31,7 @@ import subprocess
 import sys
 
 ALLOWED_PLANS = frozenset({"system", "homes"})
-ALLOWED_ACTIONS = frozenset({"--reindex", "--recover-failed"})
+ALLOWED_ACTIONS = frozenset({"--reindex", "--recover-failed", "--verify"})
 
 ALLOWED_BINARIES = (
     "/usr/bin/timetraveller-backup",

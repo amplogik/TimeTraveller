@@ -69,7 +69,7 @@ def _corrupt_frame(archive: Path, frame_id: int) -> None:
 
 def test_verify_clean(tmp_path):
     archive = _build_archive(tmp_path, "a")
-    algo, n, bad = heallib.verify_frame_checksums(archive)
+    algo, n, bad, _transient = heallib.verify_frame_checksums(archive)
     assert algo == "sha256" and n > 0 and bad == []
 
 
@@ -77,7 +77,7 @@ def test_verify_detects_corruption(tmp_path):
     archive = _build_archive(tmp_path, "a")
     victim = _big_frame_ids(archive)[1]
     _corrupt_frame(archive, victim)
-    _algo, _n, bad = heallib.verify_frame_checksums(archive)
+    _algo, _n, bad, _transient = heallib.verify_frame_checksums(archive)
     assert [b["id"] for b in bad] == [victim]
 
 
@@ -87,7 +87,7 @@ def test_verify_drop_cache_still_detects(tmp_path):
     archive = _build_archive(tmp_path, "a")
     victim = _big_frame_ids(archive)[0]
     _corrupt_frame(archive, victim)
-    _algo, _n, bad = heallib.verify_frame_checksums(archive, drop_cache=True)
+    _algo, _n, bad, _transient = heallib.verify_frame_checksums(archive, drop_cache=True)
     assert [b["id"] for b in bad] == [victim]
 
 

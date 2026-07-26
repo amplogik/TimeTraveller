@@ -40,7 +40,7 @@ def test_sidecar_is_v2_with_per_frame_sha256(tmp_path):
 
 def test_verify_clean_archive_reports_no_bad_frames(tmp_path):
     archive = _write_archive(tmp_path, os.urandom(4096 * 4))
-    algo, nframes, bad = _verify_frames(archive)
+    algo, nframes, bad, _transient = _verify_frames(archive)
     assert algo == "sha256"
     assert nframes == 4
     assert bad == []
@@ -58,7 +58,7 @@ def test_verify_detects_corruption_at_the_right_frame(tmp_path):
     raw[pos] ^= 0xFF
     archive.write_bytes(raw)
 
-    algo, nframes, bad = _verify_frames(archive)
+    algo, nframes, bad, _transient = _verify_frames(archive)
     assert nframes == 6
     assert [b["id"] for b in bad] == [3]
     assert bad[0]["uo"] == victim["uo"]
@@ -71,7 +71,7 @@ def test_verify_detects_truncated_frame(tmp_path):
     # Drop the last 10 bytes — the final frame can no longer match its digest.
     raw = archive.read_bytes()
     archive.write_bytes(raw[:-10])
-    _, _, bad = _verify_frames(archive)
+    _, _, bad, _transient = _verify_frames(archive)
     assert bad, "truncation should be reported as a corrupt frame"
 
 

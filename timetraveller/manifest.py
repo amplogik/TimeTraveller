@@ -190,6 +190,23 @@ class ShardSet:
             m.verify_state == "verified" for m in self.members)
 
     @property
+    def is_restorable(self) -> bool:
+        """True iff every shard was written and can be read — even if some frames
+        are damaged.
+
+        Weaker than `is_complete`, which additionally requires that nothing was
+        found corrupt. The distinction matters for cycle grouping: a `corrupt`
+        set is deliberately left in place, browsable and extractable, so the
+        undamaged frames restore and `--heal` can repair the rest, whereas a
+        `failed` set is not trustworthy at all. Treating the two the same made a
+        corrupt full stop opening its own cycle, which silently reparented it
+        (and every incremental taken after it) onto the PREVIOUS cycle — so
+        pruning that previous cycle would have deleted a later, usable full."""
+        return bool(self.members) and all(
+            m.status in ("ok", "ok-with-warnings", "corrupt")
+            for m in self.members)
+
+    @property
     def is_complete(self) -> bool:
         """Complete iff EVERY shard succeeded cleanly (ok/ok-with-warnings) with
         no verify-detected corruption. A single failed OR corrupt shard makes the
@@ -271,10 +288,24 @@ class Cycle:
 def cycles(manifest: Manifest) -> list[Cycle]:
     """Group shard sets into cycles.
 
-    Rule: a complete full SET opens a new cycle. Incremental sets attach to the
+    Rule: a RESTORABLE full SET opens a new cycle. Incremental sets attach to the
     most recent open cycle. A failed full set does NOT open a new cycle — its
     shards stay attached to the previous one. This keeps the restore chain
     intact when a full backup fails.
+
+    "Restorable", not "complete": a full with verify-detected corruption is still
+    a real full — it stays browsable and extractable, `--heal` can repair it, and
+    every incremental taken after it was computed against IT, not against the
+    previous full. Requiring `is_complete` here meant one corrupt frame anywhere
+    in a full reparented the whole thing (and all its incrementals) onto the
+    previous cycle: the full vanished from the cycle list, the previous cycle
+    still reported "complete" while concealing it, the restore chain was
+    misrepresented, and — worst — because `Cycle.archives` includes `incr_sets`,
+    pruning that previous cycle would have deleted the later full with it.
+
+    The cycle it opens still reports `is_complete == False` (that reads through
+    to `full_set.is_complete`), so retention keeps protecting it and it is never
+    treated as a clean base.
 
     Returned cycles are sorted oldest-first.
     """
@@ -283,13 +314,16 @@ def cycles(manifest: Manifest) -> list[Cycle]:
 
     for s in shard_sets(manifest):
         if s.kind == "full":
-            if s.is_complete:
-                # Successful full set — open a new cycle.
+            if s.is_restorable:
+                # Usable full set (clean OR corrupt-but-readable) — open a new
+                # cycle. If it is corrupt the cycle reports incomplete, which is
+                # what keeps retention protective.
                 current = Cycle(cycle_id=s.cycle_id, full_set=s, incr_sets=[])
                 result.append(current)
             else:
-                # Failed full set — don't open a new cycle. Record its shards on
-                # the current cycle for visibility without replacing the full.
+                # Failed/empty full set — don't open a new cycle. Record its
+                # shards on the current cycle for visibility without replacing
+                # the full.
                 if current is None:
                     current = Cycle(cycle_id=s.cycle_id, full_set=None, incr_sets=[])
                     result.append(current)

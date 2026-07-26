@@ -1,3 +1,61 @@
+timetraveller (1.6.1) unstable; urgency=medium
+
+  * Fix: a corrupt-but-readable full no longer vanishes from the cycle list --
+    and, more seriously, can no longer be deleted as collateral when the
+    PREVIOUS cycle is pruned. Found in the field on bast's system plan, where
+    2026-07-19_full had one corrupt frame affecting one file out of ~22 GB.
+    cycles() opened a new cycle only for a full set that `is_complete`, which
+    forbids any corrupt frame -- so that full was reparented onto Cycle
+    2026-07-12 as if it were an incremental. Consequences:
+    - The full did not appear as a cycle at all.
+    - Cycle 2026-07-12 still reported "complete" while concealing it.
+    - Every incremental from 07-20..07-25 was shown under the 07-12 cycle even
+      though they were computed against the 07-19 full -- the restore chain was
+      misrepresented.
+    - Because Cycle.archives includes incr_sets, pruning cycle 2026-07-12 would
+      have DELETED the 07-19 full's shards with it. With max_cycles and four
+      complete cycles present, that was one backup away from happening.
+    Cycle grouping now keys on a new ShardSet.is_restorable ("every shard was
+    written and can be read") rather than is_complete ("and nothing was found
+    corrupt"). A corrupt full opens its own cycle, which still reports
+    is_complete == False -- so retention keeps protecting it (incomplete cycles
+    are always kept and excluded from the limit) and it is never treated as a
+    clean base. failed/empty/in-progress fulls still do not open a cycle, which
+    was always correct: those are untrustworthy, not merely damaged.
+  * Fix: verify no longer condemns a frame on a single read. The 2026-07-19
+    "corruption" above was a FALSE POSITIVE -- re-checked afterwards, all four
+    shards verify perfectly clean (168/168 frames on both the recorded SHA-256
+    and a full zstd decode). verify_frame_checksums() read each frame exactly
+    once, immediately after writing ~22 GB across four concurrent shard threads
+    with the page cache dropped so the read goes over NFS; one transient bad
+    read became a permanent "corrupt" record. A suspect frame is now re-read
+    (evicting just that range first) and classified:
+    - a re-read that matches the digest  -> transient "read-recovered"; the
+      stored bytes are fine and nothing is condemned;
+    - every read mismatching with IDENTICAL bytes -> genuinely corrupt;
+    - every read mismatching with DIFFERENT bytes -> "unstable-read"; the read
+      path itself is unreliable, so what is stored is unproven either way.
+    Both unconfirmed classes are deliberately biased away from "corrupt" and
+    reported loudly instead: a false corrupt flag demotes a healthy full out of
+    its own cycle and does not self-clear, which is worse than an anomaly
+    warning. verify_frame_checksums() now returns a 4-tuple (algo, count, bad,
+    transient); pass retries=0 for the old single-read behaviour.
+  * Fix: --verify now reconciles the manifest instead of only printing. Nothing
+    else ever cleared a corrupt flag, so a false positive was permanent short of
+    hand-editing manifest.json. A clean verify clears a stale corrupt flag and
+    records verify_state=verified; a confirmed-corrupt archive the manifest
+    calls fine is marked corrupt. It writes only on genuine disagreement, so a
+    plain clean verify still touches nothing -- and for a system-class plan it
+    escalates only in that case, never for a no-op. --verify is now in the
+    maintain helper's action allowlist so that escalation can happen.
+    Caveat: an entry marked corrupt loses whether it was "ok" or
+    "ok-with-warnings" beforehand; it is restored as "ok" and the prior state is
+    recorded in the entry's notes.
+  * README: the install example told users to install timetraveller_1.4.3, and
+    the status line was stale again. Both now track the release.
+
+ -- Kim McCann <amplogik@gmail.com>  Sun, 26 Jul 2026 08:41:43 -0700
+
 timetraveller (1.6.0) unstable; urgency=medium
 
   * Restore to original locations now escalates instead of silently failing.

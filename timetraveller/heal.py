@@ -32,17 +32,38 @@ from . import index as indexlib
 
 # ---------- frame checksum verification (shared by D1 + D2) ----------
 
+VERIFY_RETRIES = 2
+
+
 def verify_frame_checksums(
-    archive_path: Path, *, drop_cache: bool = False,
-) -> tuple[str, int, list[dict]] | None:
+    archive_path: Path, *, drop_cache: bool = False, retries: int = VERIFY_RETRIES,
+) -> tuple[str, int, list[dict], list[dict]] | None:
     """Re-hash each frame's persisted compressed bytes against its recorded
-    `csum`. Returns (algo, frame_count, bad_frames) where each bad frame is the
-    full frame record, or None if the archive has no v2 (csum-bearing) sidecar.
+    `csum`. Returns (algo, frame_count, bad_frames, transient_frames), or None if
+    the archive has no v2 (csum-bearing) sidecar.
 
     With `drop_cache`, evict this file from the client page cache before reading
     so the check hits the backup store (which serves from its own cache, hot
     right after a write) rather than re-reading the client's own just-written
     buffer — the only way to catch a RAM→NIC→store bit flip.
+
+    **A frame is never condemned on a single read.** A mismatch is re-read up to
+    `retries` more times, evicting just that range first, and classified:
+
+      * any re-read matches the digest  -> TRANSIENT. The stored bytes are fine;
+        the earlier read was faulty. Reported in `transient`, never in `bad`.
+      * every read mismatches, all returning IDENTICAL bytes -> genuinely
+        corrupt. Reported in `bad`.
+      * every read mismatches but returns DIFFERENT bytes each time -> the read
+        path itself is unreliable, so we cannot conclude anything about what is
+        stored. Reported in `transient`, not `bad`.
+
+    Condemning on one read is how a transient NFS/link fault becomes a permanent
+    "corrupt" record: it happened to bast's 2026-07-19 system full, which was
+    flagged on one frame and re-verified perfectly clean afterwards. Both
+    "unconfirmed" classes are deliberately biased away from `bad` — a false
+    corrupt flag demotes a healthy full out of its own cycle and is not
+    self-clearing, which is far more damaging than reporting an anomaly.
     """
     sidecar = fwlib.sidecar_path(archive_path)
     if not sidecar.exists():
@@ -55,18 +76,48 @@ def verify_frame_checksums(
     if not frames or "csum" not in frames[0]:
         return None  # v1 sidecar: no per-frame digests
     algo = meta.get("csum_algo", "sha256")
+
+    def digest(b: bytes) -> str:
+        return hashlib.new(algo, b).hexdigest()
+
     bad: list[dict] = []
+    transient: list[dict] = []
     fd = os.open(str(archive_path), os.O_RDONLY)
     try:
         if drop_cache:
             os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
         for fr in frames:
             data = os.pread(fd, fr["cl"], fr["co"])
-            if len(data) != fr["cl"] or hashlib.new(algo, data).hexdigest() != fr["csum"]:
+            if len(data) == fr["cl"] and digest(data) == fr["csum"]:
+                continue
+
+            # Suspect frame — confirm before condemning.
+            seen = {digest(data)}
+            recovered = False
+            for _ in range(max(0, retries)):
+                # Evict just this range so the retry is a real re-fetch rather
+                # than the same cached (possibly bad) page.
+                try:
+                    os.posix_fadvise(fd, fr["co"], fr["cl"], os.POSIX_FADV_DONTNEED)
+                except OSError:
+                    pass
+                again = os.pread(fd, fr["cl"], fr["co"])
+                if len(again) == fr["cl"] and digest(again) == fr["csum"]:
+                    recovered = True
+                    break
+                seen.add(digest(again))
+
+            if recovered:
+                transient.append({**fr, "anomaly": "read-recovered"})
+            elif len(seen) > 1:
+                # Different bytes on different reads: the read path is unstable,
+                # so the stored content is unproven either way.
+                transient.append({**fr, "anomaly": "unstable-read"})
+            else:
                 bad.append(fr)
     finally:
         os.close(fd)
-    return (algo, len(frames), bad)
+    return (algo, len(frames), bad, transient)
 
 
 # ---------- frame → files mapping (the blast radius) ----------
@@ -117,7 +168,7 @@ def damaged_files(archive_path: Path, *, drop_cache: bool = False) -> list[str]:
     res = verify_frame_checksums(archive_path, drop_cache=drop_cache)
     if res is None:
         return []
-    _algo, _n, bad = res
+    _algo, _n, bad, _transient = res
     if not bad:
         return []
     return frames_to_files(archive_path, [fr["id"] for fr in bad])
