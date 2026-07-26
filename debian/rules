@@ -12,7 +12,14 @@ BINDIR  := $(DESTDIR)/usr/bin
 %:
 	dh $@ --with python3 --buildsystem=none
 
+# Refuse to build a package whose version strings disagree. dpkg takes the
+# package version from debian/changelog, so a stale timetraveller/__init__.py
+# silently ships a .deb that misreports its own version — and that value is
+# stamped into every archive's provenance via created_by. That shipped for three
+# releases (v1.5.1-v1.5.3) before anyone noticed. Failing the build is the only
+# check that cannot be forgotten.
 override_dh_auto_build:
+	python3 tools/check-versions.py
 
 override_dh_auto_install:
 	# Python module tree.

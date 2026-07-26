@@ -94,6 +94,20 @@ dpkg-buildpackage -us -uc -b
 
 The resulting `.deb` lands in the parent directory.
 
+#### Cutting a release
+
+The version string lives in five places, and the build **refuses to proceed if they disagree** (`debian/rules` runs `tools/check-versions.py`). `debian/changelog` is the authority — dpkg derives the actual package version from it — so the release flow is:
+
+```bash
+# 1. Write the new changelog stanza by hand (the human part).
+# 2. Bring the other four sites into line:
+python3 tools/check-versions.py --sync
+# 3. Build.
+dpkg-buildpackage -us -uc -b
+```
+
+`tools/check-versions.py` on its own just verifies and exits non-zero on a mismatch; `pytest` runs the same check, so drift usually surfaces long before a build. This exists because the version had drifted on most previous releases — including three that shipped a `.deb` whose `__version__` was stale, which matters beyond cosmetics: that value is stamped into every archive's provenance via `created_by`.
+
 ### Option 3 — Run from a checkout without installing
 
 Pure local — useful for hacking:
