@@ -20,6 +20,7 @@ from . import extract as extractlib
 from . import framewriter
 from . import heal as heallib
 from . import index as indexlib
+from . import launchers as launcherslib
 from . import manifest as manifestlib
 from . import mounts as mountslib
 from . import pax as paxlib
@@ -1026,6 +1027,42 @@ def _resolve_extract_targets(archive_dir: Path, identifier: str) -> list[Path]:
     return [p] if p.exists() else []
 
 
+def _report_orphan_launchers(into: Path) -> None:
+    """Post-restore warning: desktop launchers pointing at a program that is not
+    on this system.
+
+    A home-scoped restore returns `~/.local/share/applications/*.desktop` but
+    not the programs they name — `/usr/bin`, `/opt` and flatpak are outside
+    `$HOME`. The launcher then looks installed and dies at exit 127 when
+    clicked, showing nothing at all in a GUI. On bast that hid a dead OpenCode
+    icon for two months.
+
+    Deliberately a warning, never a failure, and never an exception: the backup
+    is fine, the restore is fine, the system is just missing something the
+    restore was never scoped to carry. A bug in this audit must not be able to
+    turn a good restore into a reported failure.
+    """
+    if os.geteuid() == 0 and os.environ.get("PKEXEC_UID"):
+        return  # privileged leg of a pkexec restore; the parent reports instead
+    try:
+        orphans = launcherslib.scan(launcherslib.dirs_under(into))
+    except Exception as e:  # noqa: BLE001 - see docstring
+        print(f"WARNING: orphaned-launcher check skipped: {e}", file=sys.stderr)
+        return
+    if not orphans:
+        return
+    print(f"WARNING: {len(orphans)} desktop launcher(s) point at a program that "
+          f"is not installed. A restore scoped to $HOME brings back the .desktop "
+          f"file but not a program under /usr/bin, /opt or flatpak; clicking one "
+          f"fails silently (exit 127).", file=sys.stderr)
+    for o in orphans[:20]:
+        print(f"    {o.desktop.name}: {o.target}  ({o.name})", file=sys.stderr)
+    if len(orphans) > 20:
+        print(f"    ... and {len(orphans) - 20} more", file=sys.stderr)
+    print("  Reinstall those programs — the restored archive itself is fine.",
+          file=sys.stderr)
+
+
 def action_extract(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
     if not args.paths:
         print("--extract: at least one path argument is required.\n"
@@ -1056,7 +1093,13 @@ def action_extract(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
     #     to their original locations instead of the requested directory.
     if extractlib.dest_needs_root(into):
         if into.resolve() == Path("/") and _needs_root_escalation(plan):
-            return _restore_via_pkexec(args, plan, args.extract, list(args.paths))
+            rc = _restore_via_pkexec(args, plan, args.extract, list(args.paths))
+            if rc == 0:
+                # Reported from HERE, not from the privileged leg: the helper
+                # captures the root run's stderr and discards it on success, so
+                # a warning printed over there would never reach the user.
+                _report_orphan_launchers(into)
+            return rc
         print(f"--extract: destination {into} is not writable by this user.\n"
               f"  Restoring to the ORIGINAL locations of a system-class plan "
               f"(--into /) escalates via pkexec automatically.\n"
@@ -1100,6 +1143,7 @@ def action_extract(args: argparse.Namespace, plan: configlib.PlanConfig) -> int:
         _log(args, f"  frames read: {frames} ({nfs_bytes/1024**2:.1f} MiB from archives)")
     _log(args, f"  bytes written: {written:,}")
     _log(args, f"  elapsed: {_hms(seconds)}")
+    _report_orphan_launchers(into)
     return 0
 
 

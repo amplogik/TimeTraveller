@@ -202,6 +202,32 @@ and run <code>--verify &lt;backup&gt;</code> to check it on demand.</p>
 persisted frames that no longer match their write-time checksum. Archives
 written before v1.6.0 carry no verify state and are left unmarked.</p>
 
+<h2>Files skipped as unreadable</h2>
+<p>A file that exists but can't be read during a backup (<i>permission
+denied</i> &mdash; usually a root-owned file inside your home directory) no
+longer fails the backup. The rest of the archive is fine, so it is marked
+<b>ok-with-warnings</b> &mdash; but that file is <b>not in the backup</b>.
+Every such file is named in the backup's notes, in the run output and in the
+plan log (<code>SKIPPED-UNREADABLE:</code>). Fix its ownership or exclude it,
+and the next run picks it up. Before v1.7.0 a single unreadable file failed the
+whole shard; use <b>Recover</b> on those.</p>
+
+<h2>Post-restore check: orphaned desktop launchers</h2>
+<p>Every restore ends with a quick audit of the <code>.desktop</code> files it
+could have touched. A restore scoped to your home directory brings the launcher
+back but <b>not</b> the program it points at &mdash; <code>/usr/bin</code>,
+<code>/opt</code> and flatpak all live outside <code>$HOME</code>. The icon then
+looks perfectly installed and does nothing at all when clicked: the process dies
+at exit 127 without drawing a window, so nothing tells you it is broken.</p>
+<p>Any launcher whose <code>Exec=</code> target is missing is listed at the end
+of the restore output. It is a <b>warning, not a failure</b> &mdash; the exit
+code is unaffected, because this says nothing about the backup's integrity, only
+that the restore's scope did not cover something outside your home directory.
+Reinstall the program; do not restore again.</p>
+<p>Watch for <code>/usr/bin/flatpak</code> in that list: if flatpak itself is
+the missing target, every flatpak app is dead at once and reinstalling any of
+them will fail until flatpak is back.</p>
+
 <h2>Restoring from a drive with no plan configured</h2>
 <p>You don't need the original machine or its config to get your files back.
 On any box with TimeTraveller installed, click <b>Restore from

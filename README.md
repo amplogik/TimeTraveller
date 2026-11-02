@@ -2,7 +2,7 @@
 
 A local Linux backup tool focused on **trustworthy backups** and **fast, partial recovery**.
 
-Status: **v1.6.1** — stable.
+Status: **v1.7.0** — stable.
 
 **Highlights since v1.0:**
 
@@ -43,7 +43,7 @@ The underlying tools — `pax` and `zstd` — already do all of this well. TimeT
 Download the `.deb` from the [latest release](https://github.com/amplogik/TimeTraveller/releases) and install:
 
 ```bash
-sudo apt install ./timetraveller_1.6.1_all.deb
+sudo apt install ./timetraveller_1.7.0_all.deb
 ```
 
 This installs:
@@ -240,6 +240,24 @@ From the CLI, restoring to the original locations of a system plan escalates the
 timetraveller-backup --plan system --extract 2026-07-22T210655_full --into / ./usr/lib/vst/
 ```
 
+### Post-restore check: orphaned desktop launchers
+
+Every restore ends with a cheap audit of the `.desktop` files it could have touched — `~/.local/share/applications` and `/usr/share/applications`, rebased under the destination when you restore into a staging directory rather than to `/`.
+
+A restore scoped to `$HOME` brings the launcher back but not the program it points at: `/usr/bin`, `/opt` and flatpak all live outside `$HOME` and were never in the archive. The result looks perfectly installed — the icon is in the app grid, the entry is valid — and clicking it dies at exit 127 without drawing a window, so nothing tells you it is broken. One of these went unnoticed on the author's machine for two months.
+
+So the summary names them:
+
+```
+WARNING: 3 desktop launcher(s) point at a program that is not installed. ...
+    OpenCode-handler.desktop: /usr/bin/OpenCode  (OpenCode)
+    chitubox.desktop: /opt/CBD/CHITUBOX_Basic/  (Chitubox 3D)
+    org.gimp.GIMP.desktop: /usr/bin/flatpak  (PhotoGIMP)
+  Reinstall those programs — the restored archive itself is fine.
+```
+
+This is a **warning, never a failure**: the exit code is unaffected. A missing launcher target says nothing about the integrity of the backup — only that the restore's scope did not include something outside `$HOME`. The fix is to reinstall the program, not to restore again. Note the third line above: when the missing target is `/usr/bin/flatpak` itself, *every* flatpak app is dead at once, and reinstalling any of them will not work until flatpak is back.
+
 ### Restoring from a drive with no plan configured
 
 You don't need the original machine or its config to get your files back. On any box with TimeTraveller installed, click **Restore from location…** in the toolbar and browse to where the backup lives — a USB drive, an external disk, or a mounted NAS share. TimeTraveller reads that location directly: the **Archives** tab fills with its cycles, and browsing, searching, and **Extract selected…** all work exactly as they do for a locally-configured plan.
@@ -262,6 +280,8 @@ A live filesystem changes under a snapshot-less backup — a browser rewrites a 
 
 - **ok** — clean.
 - **ok-with-warnings** — some files were skipped (vanished or changed mid-read), but the archive stream is structurally valid and trustworthy. This is normal for a busy home directory.
+
+  One kind of skip is **not** noise: a file that exists but can't be read (*permission denied* — typically a root-owned file in your home directory). Since v1.7.0 it no longer fails the whole backup, but the file is **not in it**, so TimeTraveller names every such file: in the run output, as a `SKIPPED-UNREADABLE:` line in the plan log, and in the backup's notes in the Archives tab. Fix its ownership (or exclude it) and the next run picks it up. Before v1.7.0 one unreadable file quarantined the entire shard as **failed**; such shards can be brought back with **Recover**.
 - **failed** — the archive itself is not trustworthy (a fatal error, a compression failure, or unreadable diagnostics). Only these are treated as failures; retention won't prune around them, and the file is quarantined for `--recover-failed`.
 - **corrupt** — the stream wrote fine, but verify-after-write found persisted frames whose bytes no longer match the checksum recorded at write time. Shown in orange; the undamaged data still restores, and `--heal` pulls clean copies of the damaged files from another cycle.
 

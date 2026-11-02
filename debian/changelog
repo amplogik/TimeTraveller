@@ -1,3 +1,62 @@
+timetraveller (1.7.0) unstable; urgency=medium
+
+  * Fix: a file tar can't read (permission denied) no longer fails the whole
+    shard. GNU tar exits 2 for it but skips just that member and the stream
+    stays valid; we were quarantining the entire archive to .failed. On bast
+    one root:root 0600 file under ~/Desktop sent a ~70 GB shard of every
+    weekly home full to .failed for seven weeks (2026-09-20 .. 2026-11-01),
+    unnoticed, leaving no complete full after 2026-09-13. Now ok-with-warnings
+    -- but unlike the vanished-file race this is not noise, the file is
+    missing from the backup, so every skipped file is NAMED: in the run
+    output, as SKIPPED-UNREADABLE in the shard log (durable for cron runs),
+    and in the manifest notes / .meta.json. EACCES on the archive itself, a
+    zstd failure or any unrecognised diagnostic still fails. Shards already
+    quarantined for this reason can be brought back with --recover-failed.
+
+  * New: a restore now ends by naming desktop launchers whose Exec= target is
+    not on this system. A restore scoped to $HOME brings back
+    ~/.local/share/applications/*.desktop but NOT the programs they point at --
+    /usr/bin, /opt and flatpak are all outside $HOME and were never in the
+    archive. The launcher survives looking perfectly installed: present in the
+    app grid, valid entry, sometimes even an executable wrapper. Nothing
+    announces the mismatch until someone clicks it, and a GUI click shows no
+    error at all -- the process dies at exit 127 without drawing a window.
+    Found on bast 2026-08-24: OpenCode's icon had been dead since a Jun 13
+    recovery, ~2 months unnoticed. Two others went with it -- /opt/CBD/
+    CHITUBOX_Basic/, and org.gimp.GIMP.desktop pointing at /usr/bin/flatpak,
+    which was itself absent, so every flatpak app was dead at once and no
+    reinstall of any of them could work until flatpak came back.
+    Details of the check:
+    - It is a WARNING and never a failure; the exit code is unchanged. A
+      missing launcher target says nothing about the integrity of the backup,
+      only that the restore's scope did not carry something outside $HOME. The
+      audit is also wrapped so that a bug in it cannot turn a good restore into
+      a reported failure.
+    - Quoted Exec= paths are parsed as one word. The obvious whitespace split
+      turns `"/home/kim/.local/share/Embodme/Erae Lab.AppImage"` into three
+      fragments and reports all three as missing -- three false positives from
+      one healthy launcher, which is exactly how an advisory check earns being
+      ignored. Verified against the real entry on bast.
+    - ~/.local/share/applications shadows /usr/share/applications by basename,
+      per the XDG lookup rule, so a working user override of a broken system
+      entry is not reported (nor the reverse).
+    - Hidden=true tombstones and entries with no Exec= (Type=Link, Type=
+      Directory) are skipped. NoDisplay=true entries are NOT: the original
+      casualty, OpenCode-handler.desktop, is one.
+    - Which directories get audited follows the destination. A restore to the
+      original locations (--into /) checks the live ones; a restore into a
+      staging directory checks the staged copies under it, warning before the
+      files are moved into place. An unrelated extract into /tmp finds no
+      launcher dirs under its destination and stays silent.
+    - Under the pkexec restore-to-original-locations path the warning is
+      emitted by the unprivileged caller, not the root leg: the helper captures
+      the privileged run's stderr and discards it on success, so a warning
+      printed there would never reach the user. The root leg also has the wrong
+      $HOME. A plain `sudo` run resolves the invoking user's home via
+      SUDO_USER instead.
+
+ -- Kim McCann <amplogik@gmail.com>  Mon, 02 Nov 2026 10:45:00 -0800
+
 timetraveller (1.6.1) unstable; urgency=medium
 
   * Fix: a corrupt-but-readable full no longer vanishes from the cycle list --
