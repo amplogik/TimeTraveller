@@ -548,6 +548,10 @@ def _mark_corrupt_shards(m: manifestlib.Manifest, archive_dir: Path,
     return ncorrupt
 
 
+# How many skipped-unreadable paths to name in output/notes before "+N more".
+_SKIPPED_SHOWN = 10
+
+
 def _finalize_one(m: manifestlib.Manifest, archive_path: Path, fname: str,
                   result, plan: configlib.PlanConfig, args: argparse.Namespace,
                   log_path: Path) -> str:
@@ -571,9 +575,24 @@ def _finalize_one(m: manifestlib.Manifest, archive_path: Path, fname: str,
         _write_entry_meta(archive_path.parent, m, fname, args)
         return status
 
+    skipped: list[str] = []
     if status == "ok-with-warnings":
         print(f"WARNING: {fname}: pax={result.pax_returncode} (non-fatal — "
               f"archive is trustworthy); see {log_path}", file=sys.stderr)
+        skipped = list(getattr(result, "skipped_unreadable", None) or [])
+        if skipped:
+            print(f"WARNING: {fname}: {len(skipped)} file(s) could not be read "
+                  f"(permission denied) and are NOT in this backup:", file=sys.stderr)
+            for path in skipped[:_SKIPPED_SHOWN]:
+                print(f"    {path}", file=sys.stderr)
+            if len(skipped) > _SKIPPED_SHOWN:
+                print(f"    ... and {len(skipped) - _SKIPPED_SHOWN} more; see {log_path}",
+                      file=sys.stderr)
+            print("  Fix the ownership/permissions (or exclude them) so the next "
+                  "run includes them.", file=sys.stderr)
+            # Durable: a scheduled run captures neither stdout nor stderr.
+            _append_to_log(log_path, f"SKIPPED-UNREADABLE: {fname}: "
+                           + ", ".join(skipped))
 
     has_sidecar = False
     sc = indexlib.sidecar_path(archive_path)
@@ -597,6 +616,13 @@ def _finalize_one(m: manifestlib.Manifest, archive_path: Path, fname: str,
                 entry.has_frames = True
             if has_sidecar:
                 entry.has_sidecar = True
+            if skipped:
+                shown = ", ".join(skipped[:_SKIPPED_SHOWN])
+                more = (f" (+{len(skipped) - _SKIPPED_SHOWN} more)"
+                        if len(skipped) > _SKIPPED_SHOWN else "")
+                note = (f"skipped {len(skipped)} unreadable file(s) "
+                        f"(permission denied): {shown}{more}")
+                entry.notes = f"{entry.notes}; {note}" if entry.notes else note
             break
     _write_entry_meta(archive_path.parent, m, fname, args)
     _log(args, f"  {fname}: {result.archive_size/1024**2:.1f} MiB"

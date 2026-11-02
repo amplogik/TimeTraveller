@@ -322,6 +322,27 @@ _BENIGN_FILE_CHANGED = re.compile(
     r":\s*file changed as we read it\s*$"
 )
 
+# A per-file skip: tar could not read a listed path because of permissions
+# (EACCES) -- typically a root-owned file dropped into $HOME. tar skips that one
+# member and keeps writing a structurally valid stream, so the rest of the
+# archive is trustworthy. Quarantining the WHOLE archive for it is far worse
+# than the skip: on 2026-11-01 one root:root 0600 file under ~/Desktop had sent
+# a ~70 GB shard of every weekly full to .failed for seven weeks running.
+# Unlike the vanished-file race this is NOT noise -- the file exists and is
+# missing from the backup -- so these are surfaced by name (skipped_unreadable)
+# in the run output and the manifest notes rather than passing silently.
+_SKIPPED_UNREADABLE = re.compile(
+    r"^tar:\s*(?P<path>.+?):\s*Cannot (?:open|opendir|stat|readlink):\s*"
+    r"Permission denied\s*$"
+)
+
+# The same skip as reported by the `pax` binary (used by run()); pax already
+# exits 1 for it, so it only matters for naming, not classification.
+_SKIPPED_UNREADABLE_PAX = re.compile(
+    r"^pax:\s*Unable to (?:open|read|access)\s+(?P<path>.+?)(?: to read)?:\s*"
+    r"Permission denied\s*$"
+)
+
 # tar's generic trailer, printed once when any per-file error occurred. Benign
 # on its own — it only summarises the per-file diagnostics above it.
 _BENIGN_SUMMARY = re.compile(
@@ -339,9 +360,10 @@ _PAX_STDERR_CAP = 1 << 20  # 1 MiB
 
 def _stderr_is_only_benign(stderr_text: str) -> bool:
     """True if every tar/pax diagnostic in `stderr_text` is a benign ENOENT
-    file-race line (or the generic failure-summary trailer).
+    file-race line, a per-file permission-denied skip, or the generic
+    failure-summary trailer.
 
-    A single unrecognised diagnostic — ENOSPC, permission denied, a zstd error,
+    A single unrecognised diagnostic — ENOSPC, a write error, a zstd error,
     a truncated-stream complaint — makes this return False.
     """
     saw_diag = False
@@ -353,11 +375,26 @@ def _stderr_is_only_benign(stderr_text: str) -> bool:
         if not (s.startswith("tar:")
                 and (_BENIGN_FILE_ENOENT.search(s)
                      or _BENIGN_FILE_CHANGED.search(s)
+                     or _SKIPPED_UNREADABLE.search(s)
                      or _BENIGN_SUMMARY.search(s))):
             return False
     # Exit was >=2, so there must be *some* diagnostic explaining it; if we
     # captured none we recognise, don't certify the archive as trustworthy.
     return saw_diag
+
+
+def skipped_unreadable(stderr_text: str | None) -> list[str]:
+    """Paths tar skipped because it could not read them (permission denied),
+    in stderr order, de-duplicated. Empty if none or stderr wasn't captured."""
+    if not stderr_text:
+        return []
+    out: list[str] = []
+    for line in stderr_text.splitlines():
+        s = line.strip()
+        mt = _SKIPPED_UNREADABLE.match(s) or _SKIPPED_UNREADABLE_PAX.match(s)
+        if mt and mt.group("path") not in out:
+            out.append(mt.group("path"))
+    return out
 
 
 class _StderrCapture:
@@ -451,6 +488,11 @@ class RunResult:
     @property
     def ok(self) -> bool:
         return self.status != "failed"
+
+    @property
+    def skipped_unreadable(self) -> list[str]:
+        """Files that exist but are NOT in this archive (permission denied)."""
+        return skipped_unreadable(self.pax_stderr)
 
 
 def run(invocation: PaxInvocation, *, log_file: Path | None = None) -> RunResult:

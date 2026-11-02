@@ -115,12 +115,52 @@ def test_pax_two_enospc_is_failed():
     assert r.ok is False
 
 
-def test_pax_two_permission_denied_is_failed():
-    """Permission denied is not the vanished-file race; stay failed."""
-    stderr = ("tar: ./home/kim/.ssh/id_ed25519: Cannot open: Permission denied\n"
+# The real 2026-11-01 run, from ~/.local/state/timetraveller/home.s5of8.log (path genericised):
+# one root:root 0600 file sent a ~70 GB shard of every weekly full to .failed.
+_ROOT_OWNED_STDERR = """\
+tar: ./home/kim/Desktop/root-owned.properties: Cannot open: Permission denied
+tar: Exiting with failure status due to previous errors
+"""
+
+
+def test_pax_two_permission_denied_is_warnings():
+    """A per-file permission-denied skip leaves the stream valid: warn, don't
+    quarantine the whole archive."""
+    r = _result(2, 0, pax_stderr=_ROOT_OWNED_STDERR)
+    assert r.status == "ok-with-warnings"
+    assert r.ok is True
+    assert r.skipped_unreadable == [
+        "./home/kim/Desktop/root-owned.properties"]
+
+
+def test_permission_denied_variants_and_dedupe():
+    stderr = ("tar: ./home/kim/a: Cannot open: Permission denied\n"
+              "tar: ./home/kim/dir: Cannot opendir: Permission denied\n"
+              "tar: ./home/kim/b: Cannot stat: Permission denied\n"
+              "tar: ./home/kim/a: Cannot open: Permission denied\n"
+              "tar: ./home/kim/gone: Cannot stat: No such file or directory\n"
               "tar: Exiting with failure status due to previous errors\n")
     r = _result(2, 0, pax_stderr=stderr)
+    assert r.status == "ok-with-warnings"
+    # Vanished files are noise and not listed; unreadable ones are, once each.
+    assert r.skipped_unreadable == ["./home/kim/a", "./home/kim/dir", "./home/kim/b"]
+
+
+def test_permission_denied_writing_archive_is_failed():
+    """EACCES on the OUTPUT (not a per-file skip) is fatal and stays failed."""
+    stderr = ("tar: ./home/kim/a: Cannot open: Permission denied\n"
+              "zstd: /mnt/Backups/x.pax.zst: Permission denied\n")
+    r = _result(2, 0, pax_stderr=stderr)
     assert r.status == "failed"
+
+
+def test_permission_denied_but_zstd_failed_is_failed():
+    r = _result(2, 1, pax_stderr=_ROOT_OWNED_STDERR)
+    assert r.status == "failed"
+
+
+def test_no_skips_when_stderr_uncaptured():
+    assert _result(1, 0).skipped_unreadable == []
 
 
 def test_pax_two_benign_stderr_but_zstd_failed_is_failed():
