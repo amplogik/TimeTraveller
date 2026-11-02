@@ -123,6 +123,69 @@ def test_retries_can_be_disabled(monkeypatch, tmp_path):
     assert len(bad) == 1 and transient == []      # condemned, as the old code did
 
 
+def _reads(monkeypatch, archive, script):
+    """pread returns script[i] for the i-th read (None = the real bytes)."""
+    real_pread = os.pread
+    calls = {"n": 0}
+
+    def fake(fd, length, offset):
+        i = calls["n"]
+        calls["n"] += 1
+        b = script[i] if i < len(script) else None
+        return real_pread(fd, length, offset) if b is None else b * length
+
+    monkeypatch.setattr(heallib.os, "pread", fake)
+    return calls
+
+
+def test_store_cached_bad_copy_recovers_on_deferred_pass(monkeypatch, tmp_path,
+                                                         _no_deferred_wait):
+    """truenas 2026-11-02: the NAS kept serving the same flipped copy to every
+    immediate retry, then the true bytes once its cache dropped it."""
+    archive = _fake_archive(tmp_path)
+    calls = _reads(monkeypatch, archive, [b"X", b"X", b"X", None])
+    _a, _n, bad, transient = heallib.verify_frame_checksums(archive)
+    assert bad == []
+    assert [t["anomaly"] for t in transient] == ["deferred-recovered"]
+    assert calls["n"] == 4                        # 1 + 2 retries + 1 deferred
+    assert _no_deferred_wait == [heallib.VERIFY_DEFERRED_DELAY_S]
+
+
+def test_deferred_pass_new_bytes_is_unstable_not_corrupt(monkeypatch, tmp_path):
+    archive = _fake_archive(tmp_path)
+    _reads(monkeypatch, archive, [b"X", b"X", b"X", b"Y"])
+    _a, _n, bad, transient = heallib.verify_frame_checksums(archive)
+    assert bad == []
+    assert [t["anomaly"] for t in transient] == ["unstable-read"]
+
+
+def test_deferred_pass_same_bytes_is_corrupt(monkeypatch, tmp_path):
+    archive = _fake_archive(tmp_path)
+    _reads(monkeypatch, archive, [b"X", b"X", b"X", b"X"])
+    _a, _n, bad, transient = heallib.verify_frame_checksums(archive)
+    assert len(bad) == 1 and transient == []
+
+
+def test_no_pause_when_nothing_is_suspect(tmp_path, _no_deferred_wait):
+    archive = _fake_archive(tmp_path)
+    heallib.verify_frame_checksums(archive)
+    assert _no_deferred_wait == []
+
+
+def test_deferred_delay_override(monkeypatch, tmp_path, _no_deferred_wait):
+    archive = _fake_archive(tmp_path)
+    _reads(monkeypatch, archive, [b"X", b"X", b"X", None])
+    heallib.verify_frame_checksums(archive, deferred_delay=5)
+    assert _no_deferred_wait == [5]
+
+
+def test_retries_disabled_skips_deferred_pass(monkeypatch, tmp_path, _no_deferred_wait):
+    archive = _fake_archive(tmp_path)
+    _reads(monkeypatch, archive, [b"X"])
+    _a, _n, bad, _t = heallib.verify_frame_checksums(archive, retries=0)
+    assert len(bad) == 1 and _no_deferred_wait == []
+
+
 # ---------- 2. manifest reconciliation ----------
 
 def _entry(fn, **kw):

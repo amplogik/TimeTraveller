@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -34,9 +35,15 @@ from . import index as indexlib
 
 VERIFY_RETRIES = 2
 
+# Pause before the deferred re-check of frames that failed every immediate
+# retry (see verify_frame_checksums). Only paid when a suspect exists.
+VERIFY_DEFERRED_DELAY_S = 60.0
+_sleep = time.sleep  # indirection so tests don't wait
+
 
 def verify_frame_checksums(
     archive_path: Path, *, drop_cache: bool = False, retries: int = VERIFY_RETRIES,
+    deferred_delay: float | None = None,
 ) -> tuple[str, int, list[dict], list[dict]] | None:
     """Re-hash each frame's persisted compressed bytes against its recorded
     `csum`. Returns (algo, frame_count, bad_frames, transient_frames), or None if
@@ -57,6 +64,24 @@ def verify_frame_checksums(
       * every read mismatches but returns DIFFERENT bytes each time -> the read
         path itself is unreliable, so we cannot conclude anything about what is
         stored. Reported in `transient`, not `bad`.
+
+    **Identical bad bytes on every immediate retry are still not proof.** The
+    retries above evict only THIS client's page cache. If the bytes were flipped
+    in the backup store's memory (e.g. ZFS ARC on a non-ECC NAS), the store keeps
+    serving the same bad copy from its cache, so every immediate retry agrees
+    and the frame would be condemned. That is what happened on truenas: frames
+    flagged in 8 shards between Jul and Nov all read back correct, repeatedly, on
+    the NAS and over NFS, once that cached copy was gone (2026-11-02). So such a
+    frame is only a SUSPECT. After the whole archive has been swept (tens of GB
+    of other reads, the best a client can do to push it out of the store's
+    cache) and a pause of `deferred_delay` seconds, each suspect is re-read once
+    more:
+
+      * matches the digest           -> TRANSIENT ("deferred-recovered").
+      * different bytes than before  -> TRANSIENT ("unstable-read").
+      * same wrong bytes again       -> corrupt, in `bad`.
+
+    `retries=0` disables both the immediate retries and the deferred pass.
 
     Condemning on one read is how a transient NFS/link fault becomes a permanent
     "corrupt" record: it happened to bast's 2026-07-19 system full, which was
@@ -82,6 +107,7 @@ def verify_frame_checksums(
 
     bad: list[dict] = []
     transient: list[dict] = []
+    suspects: list[tuple[dict, set[str]]] = []
     fd = os.open(str(archive_path), os.O_RDONLY)
     try:
         if drop_cache:
@@ -113,8 +139,29 @@ def verify_frame_checksums(
                 # Different bytes on different reads: the read path is unstable,
                 # so the stored content is unproven either way.
                 transient.append({**fr, "anomaly": "unstable-read"})
+            elif retries > 0:
+                suspects.append((fr, seen))
             else:
                 bad.append(fr)
+
+        # Deferred pass: re-read suspects once the store's cache has had the
+        # whole sweep (and a pause) to drop its copy.
+        if suspects:
+            delay = VERIFY_DEFERRED_DELAY_S if deferred_delay is None else deferred_delay
+            if delay > 0:
+                _sleep(delay)
+            for fr, seen in suspects:
+                try:
+                    os.posix_fadvise(fd, fr["co"], fr["cl"], os.POSIX_FADV_DONTNEED)
+                except OSError:
+                    pass
+                again = os.pread(fd, fr["cl"], fr["co"])
+                if len(again) == fr["cl"] and digest(again) == fr["csum"]:
+                    transient.append({**fr, "anomaly": "deferred-recovered"})
+                elif digest(again) not in seen:
+                    transient.append({**fr, "anomaly": "unstable-read"})
+                else:
+                    bad.append(fr)
     finally:
         os.close(fd)
     return (algo, len(frames), bad, transient)

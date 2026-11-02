@@ -1,3 +1,24 @@
+timetraveller (1.7.1) unstable; urgency=medium
+
+  * Fix: verify-after-write no longer condemns a frame because the backup
+    server kept serving the same bad cached copy. Immediate retries evict
+    only the client's page cache. A frame flipped in the server's memory
+    (ZFS ARC on a non-ECC NAS) is served identically to every retry, so it
+    was marked corrupt -- and a corrupt flag makes the cycle incomplete,
+    which retention never prunes. On truenas, frames flagged in 8 shards
+    between Jul and Nov all read back correct, repeatedly, on the NAS and
+    over NFS once that cached copy was gone (2026-11-02), and pruning had
+    been blocked for months, filling tank to 86%.
+    A frame that fails every immediate retry is now a suspect. After the
+    whole archive has been swept and a 60 s pause, suspects are re-read:
+    correct -> transient ("deferred-recovered"); new bytes -> transient
+    ("unstable-read"); the same wrong bytes -> corrupt. The pause is only
+    paid when a suspect exists. retries=0 disables both passes.
+    Existing false flags clear with `--verify <backup>` (which already
+    clears a stale corrupt flag on a clean result).
+
+ -- Kim McCann <amplogik@gmail.com>  Mon, 02 Nov 2026 12:30:00 -0800
+
 timetraveller (1.7.0) unstable; urgency=medium
 
   * Fix: a file tar can't read (permission denied) no longer fails the whole

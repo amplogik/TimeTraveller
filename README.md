@@ -2,7 +2,7 @@
 
 A local Linux backup tool focused on **trustworthy backups** and **fast, partial recovery**.
 
-Status: **v1.7.0** — stable.
+Status: **v1.7.1** — stable.
 
 **Highlights since v1.0:**
 
@@ -43,7 +43,7 @@ The underlying tools — `pax` and `zstd` — already do all of this well. TimeT
 Download the `.deb` from the [latest release](https://github.com/amplogik/TimeTraveller/releases) and install:
 
 ```bash
-sudo apt install ./timetraveller_1.7.0_all.deb
+sudo apt install ./timetraveller_1.7.1_all.deb
 ```
 
 This installs:
@@ -283,7 +283,7 @@ A live filesystem changes under a snapshot-less backup — a browser rewrites a 
 
   One kind of skip is **not** noise: a file that exists but can't be read (*permission denied* — typically a root-owned file in your home directory). Since v1.7.0 it no longer fails the whole backup, but the file is **not in it**, so TimeTraveller names every such file: in the run output, as a `SKIPPED-UNREADABLE:` line in the plan log, and in the backup's notes in the Archives tab. Fix its ownership (or exclude it) and the next run picks it up. Before v1.7.0 one unreadable file quarantined the entire shard as **failed**; such shards can be brought back with **Recover**.
 - **failed** — the archive itself is not trustworthy (a fatal error, a compression failure, or unreadable diagnostics). Only these are treated as failures; retention won't prune around them, and the file is quarantined for `--recover-failed`.
-- **corrupt** — the stream wrote fine, but verify-after-write found persisted frames whose bytes no longer match the checksum recorded at write time. Shown in orange; the undamaged data still restores, and `--heal` pulls clean copies of the damaged files from another cycle.
+- **corrupt** — the stream wrote fine, but verify-after-write found persisted frames whose bytes no longer match the checksum recorded at write time. A frame is never condemned on one read: a mismatch is retried at once, and if every retry returns the same wrong bytes it is re-read **again after the rest of the archive has been checked and a short pause**, because a backup server can keep serving a copy that went bad in its own memory until its cache drops it. Only bytes that are still wrong then are marked corrupt; frames that recover are reported as transient read errors, which point at the reading path or the server, not the backup. Shown in orange; the undamaged data still restores, and `--heal` pulls clean copies of the damaged files from another cycle.
 
 ### "ok (unverified)" — written, but not checked
 

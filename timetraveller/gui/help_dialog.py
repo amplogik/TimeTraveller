@@ -201,6 +201,14 @@ and run <code>--verify &lt;backup&gt;</code> to check it on demand.</p>
 <p>Compare <b>corrupt</b> (orange): there, the check <i>did</i> run and found
 persisted frames that no longer match their write-time checksum. Archives
 written before v1.6.0 carry no verify state and are left unmarked.</p>
+<p>A frame is never marked corrupt on one read. A mismatch is retried at once,
+and if the same wrong bytes keep coming back it is checked again after the rest
+of the backup and a short pause, because a backup server can keep serving a copy
+that went bad in its own memory until its cache lets it go. Frames that come
+back correct are reported as <i>transient read errors</i>: a sign of trouble in
+the reading path or the server, not in the backup. To re-check a backup already
+marked corrupt, run <code>--verify &lt;backup&gt;</code>; a clean result clears the
+mark.</p>
 
 <h2>Files skipped as unreadable</h2>
 <p>A file that exists but can't be read during a backup (<i>permission
