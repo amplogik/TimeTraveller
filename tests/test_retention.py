@@ -154,3 +154,100 @@ def test_keep_all_with_empty_manifest():
     plan = apply(m, policy="keep_all", now=NOW)
     assert plan.delete == []
     assert plan.keep == []
+
+
+# --- Incomplete cycles outside the retention window (1.7.2) -----------------
+
+def _bast_like(n_complete: int) -> Manifest:
+    """An old complete cycle, then one incomplete cycle holding several failed
+    fulls and their incrementals (the 2026-09-27 shape on bast), then
+    ``n_complete`` complete weekly cycles."""
+    ar = [_entry("2026-03-01", "full")]
+    ar.append(_entry("2026-03-08", "full", status="corrupt"))
+    for d in ("2026-03-09", "2026-03-10"):
+        ar.append(_entry(d, "incr", cycle_id="2026-03-08"))
+    for d in ("2026-03-15", "2026-03-22"):
+        ar.append(_entry(d, "full", status="failed", cycle_id="2026-03-08"))
+    start = datetime(2026, 3, 29, tzinfo=timezone.utc)
+    for i in range(n_complete):
+        ar.append(_entry((start + timedelta(weeks=i)).date().isoformat(), "full"))
+    return Manifest(plan_name="home", archives=ar)
+
+
+def _ids(cs):
+    return sorted(c.cycle_id for c in cs)
+
+
+def test_incomplete_kept_while_policy_not_saturated():
+    """Fewer complete cycles than max_cycles: the window reaches back past
+    everything, so nothing is outside it -- incomplete or not."""
+    plan = apply(_bast_like(2), policy="max_cycles", max_cycles=8, now=NOW)
+    assert plan.delete == []
+    assert "inside the retention window" in plan.reasons["2026-03-08"]
+
+
+def test_incomplete_deleted_once_outside_max_cycles_window():
+    plan = apply(_bast_like(3), policy="max_cycles", max_cycles=3, now=NOW)
+    assert _ids(plan.delete) == ["2026-03-01", "2026-03-08"]
+    assert "outside the retention window" in plan.reasons["2026-03-08"]
+    # Deleting the incomplete cycle takes every one of its sets with it.
+    gone = {a.filename for c in plan.delete for a in c.archives}
+    assert "2026-03-22_full.pax.zst" in gone and "2026-03-10_incr.pax.zst" in gone
+
+
+def test_incomplete_inside_window_is_kept_and_not_counted():
+    """An incomplete cycle sandwiched between kept complete cycles stays, and
+    doesn't use up one of the N slots."""
+    m = Manifest(plan_name="home", archives=[
+        _entry("2026-04-19", "full"),
+        _entry("2026-04-26", "full"),
+        _entry("2026-05-03", "full", status="corrupt"),
+        _entry("2026-05-10", "full"),
+        _entry("2026-05-17", "full"),
+    ])
+    plan = apply(m, policy="max_cycles", max_cycles=3, now=NOW)
+    assert _ids(plan.keep) == ["2026-04-26", "2026-05-03", "2026-05-10", "2026-05-17"]
+    assert _ids(plan.delete) == ["2026-04-19"]
+
+
+def test_incomplete_newer_than_every_complete_is_never_deleted():
+    m = Manifest(plan_name="home", archives=[
+        _entry("2026-05-03", "full"),
+        _entry("2026-05-10", "full", status="failed"),
+        _entry("2026-05-17", "full", status="corrupt"),
+    ])
+    for kw in ({"policy": "max_cycles", "max_cycles": 1},
+               {"policy": "max_age_days", "max_age_days": 1},
+               {"policy": "max_size_gb", "max_size_gb": 0.0000001}):
+        plan = apply(m, now=NOW + timedelta(days=365), **kw)
+        assert "2026-05-17" in _ids(plan.keep), kw
+        assert "2026-05-03" in _ids(plan.keep), kw   # newest complete floor
+
+
+def test_incomplete_max_age_judged_by_newest_archive_not_cycle_start():
+    """The cycle STARTED before the cutoff but its last incremental is after it:
+    still inside the window."""
+    m = Manifest(plan_name="home", archives=[
+        _entry("2026-04-26", "full", status="corrupt"),
+        _entry("2026-05-08", "incr", cycle_id="2026-04-26"),
+        _entry("2026-05-10", "full"),
+        _entry("2026-05-17", "full"),
+    ])
+    plan = apply(m, policy="max_age_days", max_age_days=14, now=NOW)  # cutoff 05-06
+    assert "2026-04-26" in _ids(plan.keep)
+    plan = apply(m, policy="max_age_days", max_age_days=10, now=NOW)  # cutoff 05-10
+    assert "2026-04-26" in _ids(plan.delete)
+
+
+def test_incomplete_max_size_only_when_cap_is_binding():
+    m = _bast_like(3)
+    roomy = apply(m, policy="max_size_gb", max_size_gb=1000, now=NOW)
+    assert roomy.delete == []
+    tight = apply(m, policy="max_size_gb", max_size_gb=200 / 1024**3, now=NOW)
+    assert "2026-03-08" in _ids(tight.delete)
+    assert "2026-03-01" in _ids(tight.delete)
+
+
+def test_keep_all_still_keeps_old_incomplete():
+    plan = apply(_bast_like(5), policy="keep_all", max_cycles=1, now=NOW)
+    assert plan.delete == []

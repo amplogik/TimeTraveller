@@ -1,3 +1,22 @@
+timetraveller (1.7.2) unstable; urgency=medium
+
+  * Retention: incomplete cycles are no longer kept forever. A cycle whose
+    full is failed or corrupt still doesn't count toward the limit and is
+    still kept while it is inside the retention window, but once it falls
+    wholly outside the window -- and a newer complete cycle exists -- it is
+    pruned like any other expired cycle. Window per policy: max_cycles =
+    older than the oldest kept complete cycle, once at least N complete
+    cycles exist; max_size_gb = same, once the cap is binding; max_age_days
+    = the cycle's NEWEST archive started before the cutoff. An incomplete
+    cycle newer than every complete cycle is never pruned.
+    Before this, flagged fulls from Jul to Nov 1 (false-positive verify
+    flags, and one unreadable file failing a shard) left bast's home plan
+    with 17 weekly fulls / 12 TB under max_cycles=4, and tank hit 95%.
+  * Active->Archive switch now also removes incomplete cycles older than the
+    kept one, which matches what its confirmation dialog already says.
+
+ -- Kim McCann <amplogik@gmail.com>  Thu, 19 Nov 2026 09:36:41 -0700
+
 timetraveller (1.7.1) unstable; urgency=medium
 
   * Fix: verify-after-write no longer condemns a frame because the backup

@@ -1,11 +1,26 @@
 """Cycle-aware retention.
 
-Retention always operates on whole cycles, never individual archives. A cycle
-that has no successful full is never selected for deletion — its incrementals
-might still be useful for diagnosing the failed run, and removing them would
-leave the user with no record. The current (newest) cycle is also always kept,
-even if policy says otherwise. The result: there is always at least one
-complete cycle on disk after retention runs (assuming one ever existed).
+Retention always operates on whole cycles, never individual archives. The
+newest complete cycle is always kept, even if policy says otherwise, so there is
+always at least one complete cycle on disk after retention runs (assuming one
+ever existed).
+
+Incomplete cycles (failed, missing or verify-flagged fulls) do not count toward
+the limit, and they are kept while they are still inside the retention window:
+they may be the only record of a recent run worth diagnosing or recovering. Once
+an incomplete cycle falls wholly OUTSIDE the window, and a newer complete cycle
+exists, it is deleted like any other expired cycle. Before 1.7.2 incomplete
+cycles were kept forever, and a summer of flagged fulls (each one false-positive
+or a single unreadable file) grew one plan to 17 weekly fulls / 12 TB while
+max_cycles was 4.
+
+"Outside the window" per policy:
+  max_cycles    the policy is saturated (at least N complete cycles exist) and
+                the cycle is older than the oldest complete cycle kept
+  max_size_gb   the cap is binding (it dropped a complete cycle) and the cycle
+                is older than the oldest complete cycle kept
+  max_age_days  the cycle's newest archive started before the cutoff and the
+                cycle is older than the newest complete cycle
 """
 
 from __future__ import annotations
@@ -52,13 +67,11 @@ def apply(manifest: Manifest, *, policy: str, max_cycles: int = 4,
     keep: list[Cycle] = []
     delete: list[Cycle] = []
     reasons: dict[str, str] = {}
-
-    # Incomplete cycles (failed fulls / orphan incrementals) are always kept
-    # for now — the user might want to inspect them. They're not counted
-    # toward retention limits.
-    for c in incomplete:
-        keep.append(c)
-        reasons[c.cycle_id] = "incomplete cycle; not subject to retention"
+    # Where the retention window starts, for judging incomplete cycles. None =
+    # the policy isn't binding yet, so nothing is outside the window.
+    window_start: str | None = None
+    window_desc = ""
+    age_cutoff: datetime | None = None
 
     if policy == "max_cycles":
         # Keep the N newest complete cycles.
@@ -71,6 +84,9 @@ def apply(manifest: Manifest, *, policy: str, max_cycles: int = 4,
         for c in to_delete:
             delete.append(c)
             reasons[c.cycle_id] = f"older than the {n} most recent complete cycles"
+        if len(complete) >= n:
+            window_start = to_keep[0].cycle_id
+            window_desc = f"max_cycles={n}"
 
     elif policy == "max_age_days":
         if max_age_days is None:
@@ -91,6 +107,7 @@ def apply(manifest: Manifest, *, policy: str, max_cycles: int = 4,
                     reasons[c.cycle_id] = "newest complete cycle (always kept)"
                 else:
                     reasons[c.cycle_id] = f"within max_age_days={max_age_days}"
+        age_cutoff = cutoff
 
     elif policy == "max_size_gb":
         if max_size_gb is None:
@@ -109,9 +126,22 @@ def apply(manifest: Manifest, *, policy: str, max_cycles: int = 4,
             else:
                 delete.append(c)
                 reasons[c.cycle_id] = f"would exceed max_size_gb={max_size_gb}"
+        if delete:
+            window_start = min(kept_ids)
+            window_desc = f"max_size_gb={max_size_gb}"
 
     else:
         raise ValueError(f"unknown retention policy {policy!r}")
+
+    for c in incomplete:
+        if _incomplete_expired(c, newest_complete, window_start, age_cutoff):
+            delete.append(c)
+            reasons[c.cycle_id] = ("incomplete cycle outside the retention window "
+                                   f"({window_desc or f'max_age_days={max_age_days}'})")
+        else:
+            keep.append(c)
+            reasons[c.cycle_id] = ("incomplete cycle inside the retention window; "
+                                   "kept, not counted toward the limit")
 
     # Final safety check: never delete the newest complete cycle.
     if newest_complete in delete:
@@ -120,6 +150,37 @@ def apply(manifest: Manifest, *, policy: str, max_cycles: int = 4,
         reasons[newest_complete.cycle_id] = "newest complete cycle (always kept)"
 
     return RetentionPlan(delete=delete, keep=keep, reasons=reasons)
+
+
+def _last_started(c: Cycle) -> datetime | None:
+    """Start time of the cycle's newest archive, or None if any is unparseable
+    (unknown age: treat as fresh, never as expired)."""
+    latest: datetime | None = None
+    for a in c.archives:
+        try:
+            t = datetime.fromisoformat(a.date_started)
+        except (TypeError, ValueError):
+            return None
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        if latest is None or t > latest:
+            latest = t
+    return latest
+
+
+def _incomplete_expired(c: Cycle, newest_complete: Cycle,
+                        window_start: str | None,
+                        age_cutoff: datetime | None) -> bool:
+    # Never drop an incomplete cycle that is newer than every complete one: it
+    # may be the most recent data there is.
+    if c.cycle_id >= newest_complete.cycle_id:
+        return False
+    if age_cutoff is not None:
+        last = _last_started(c)
+        return last is not None and last < age_cutoff
+    # Cycles are contiguous in time, so a cycle that starts before the oldest
+    # kept complete cycle also ends before it.
+    return window_start is not None and c.cycle_id < window_start
 
 
 def format_plan(plan: RetentionPlan) -> str:

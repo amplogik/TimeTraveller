@@ -102,7 +102,7 @@ def test_retention_keeps_the_corrupt_cycle_and_does_not_count_it():
     deleted = {c.cycle_id for c in plan.delete}
     assert "2026-07-19" in kept
     assert "2026-07-19" not in deleted
-    assert plan.reasons["2026-07-19"] == "incomplete cycle; not subject to retention"
+    assert plan.reasons["2026-07-19"].startswith("incomplete cycle inside the retention window")
 
 
 def test_failed_full_still_does_not_open_a_cycle():

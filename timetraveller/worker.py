@@ -1957,7 +1957,9 @@ def prune_to_newest_cycle(plan: configlib.PlanConfig, log=None) -> list:
 
     Returns the list of deleted Cycles (each carries its archives list, so the
     caller can summarise what was removed). Incomplete cycles follow the same
-    retention rule as normal pruning: they are kept (see retention.py docstring).
+    retention rule as normal pruning: older than the newest complete cycle =
+    outside a max_cycles=1 window = deleted; newer ones are kept (see the
+    retention.py docstring).
     """
     archive_dir = plan.archive_dir()
     mpath = manifestlib.manifest_path(archive_dir)
